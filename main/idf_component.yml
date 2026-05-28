@@ -1,0 +1,16 @@
+## IDF Component Manager Manifest File
+dependencies:
+  lvgl/lvgl:
+    version: 9.2.*
+    public: true
+  espressif/esp_lcd_st7701: ^1.1.3
+  espressif/esp_tinyusb: ^1.4
+  espressif/esp_lvgl_port: 2.7.*
+  # Wi-Fi via onboard ESP32-C6 (esp_hosted SDIO link).
+  # Vendor xiaozhi2.0.4.bin used esp_hosted ~2.4.3 (commit 757e90b, Nov 2025,
+  # never published to registry). Closest public release in registry near
+  # that date is 2.8.0. C6 slave on board is v2.3.2.
+  espressif/esp_hosted:
+    version: "==2.8.0"
+  espressif/esp_wifi_remote:
+    version: "==1.1.2"

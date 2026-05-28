@@ -1,0 +1,27 @@
+menu "Eva Weather"
+
+    config EVA_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "YOUR_WIFI_SSID"
+        help
+            Wi-Fi network name used by the ESP32-C6 hosted radio.
+
+    config EVA_WIFI_PASSWORD
+        string "Wi-Fi password"
+        default "YOUR_WIFI_PASSWORD"
+        help
+            Wi-Fi password. Change this locally before flashing.
+
+    config EVA_WEATHER_LATITUDE
+        string "Weather latitude"
+        default "50.447914"
+        help
+            Latitude for Open-Meteo and Clear Outside requests.
+
+    config EVA_WEATHER_LONGITUDE
+        string "Weather longitude"
+        default "30.522192"
+        help
+            Longitude for Open-Meteo and Clear Outside requests.
+
+endmenu
