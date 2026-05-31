@@ -169,6 +169,7 @@ status
 perf
 time
 tz
+clockoffset <hours>
 weather
 weather refresh
 screenshot
@@ -226,9 +227,12 @@ Debug deterministic render variants:
 
 ```text
 weatherdebug rain 42
+clockoffset 3
+wind -40
+wind clear
 ```
 
-`frame` works as a repeatable seed for cloud variation.
+`frame` works as a repeatable seed for cloud variation. `clockoffset` only shifts the visual scene and clock; it does not rewrite the saved timezone. `wind <signed_kph>` is a temporary renderer override for checking both drift directions.
 
 ## Important Files
 
@@ -246,6 +250,7 @@ weatherdebug rain 42
 | `partitions.csv` | Partition table. |
 | `flash.sh` | Auto-flash helper for the P4 USB CDC/ROM port flow. |
 | `tools/eva-screenshot.py` | Screenshot helper through CDC. |
+| `tools/cdc_shoot.py` | Batch CDC helper for clock offsets, weatherdebug, and screenshots. |
 
 ## Notes For GitHub Users
 

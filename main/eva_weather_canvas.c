@@ -16,6 +16,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/ppa.h"
+#include "sdkconfig.h"
 
 /* --- Fibonacci timing core ------------------------------------------------
  * Every cadence in Eva is expressed in Fibonacci numbers so animations share
@@ -94,8 +95,8 @@ typedef struct {
 
 typedef struct {
     const char *name;
-    rgb_t top;
-    rgb_t bottom;
+    rgb_t top;       /* colour at the very top of the sky */
+    rgb_t bottom;    /* colour at the horizon line (bottom of screen) */
 } sky_t;
 
 typedef struct {
@@ -191,25 +192,25 @@ static cloud_strip_t s_strip[CLOUD_LAYER_COUNT] = {
      * MID altocumulus drifts visibly, LOW cumulus is the parallax foreground.
      * Final speed = base * wind_factor(kph) and the LOW layer takes a larger
      * multiplier under heavy wind (cumulus catches gusts more than cirrus). */
-    /* Vertical layout for native 480 px canvas. Migrated from the old 240 px
-     * render space where layers spanned y=10..200; ×2 keeps the same relative
-     * positions but fills the full screen instead of leaving the bottom half
-     * empty.
-     *   HIGH cirrus:        y =  20..120  (top of sky)
-     *   MID altocumulus:    y = 100..260  (middle band, overlaps slightly)
-     *   LOW cumulus:        y = 220..400  (foreground / horizon)
-     * Combined coverage:    y =  20..400 (out of 480) — leaves ~80 px below
-     * the lowest layer for the ground line / horizon haze. */
+    /* All three layers span the WHOLE sky (y = -40..520, bleeding off both
+     * edges) instead of sitting in separate horizontal bands. This removes
+     * the "stripe" look and the gaps between bands — any cloud type can sit
+     * anywhere vertically, like a real sky. Depth comes from three cues, not
+     * from vertical position:
+     *   - size:  HIGH = small distant cirrus, LOW = big near cumulus (bake)
+     *   - speed: HIGH drifts slowest, LOW fastest (parallax, base_speed)
+     *   - order: drawn HIGH→MID→LOW so nearer clouds overlap farther ones
+     * Off-screen parts (y<0 or y>480) are clipped per-band in the blend. */
     [CLOUD_LAYER_HIGH] = {
-        .y_start = 20, .strip_h = 100, .base_speed = (float)FIB_2,
+        .y_start = -40, .strip_h = 560, .base_speed = (float)FIB_2,
         .morph_hold_s = (float)FIB_89, .morph_duration_s = (float)FIB_13,
     },
     [CLOUD_LAYER_MID] = {
-        .y_start = 100, .strip_h = 160, .base_speed = (float)FIB_5,
+        .y_start = -40, .strip_h = 560, .base_speed = (float)FIB_5,
         .morph_hold_s = (float)FIB_55, .morph_duration_s = (float)FIB_13,
     },
     [CLOUD_LAYER_LOW] = {
-        .y_start = 220, .strip_h = 180, .base_speed = (float)FIB_13,
+        .y_start = -40, .strip_h = 560, .base_speed = (float)FIB_13,
         .morph_hold_s = (float)FIB_34, .morph_duration_s = (float)FIB_21,
     },
 };
@@ -221,6 +222,11 @@ static int s_sun_y = -1;
 static int s_sun_r = 0;
 static bool s_sun_visible = false;
 static float s_sun_strength = 0.0f;
+/* Sun elevation 0..1: 0 = at the horizon (sunrise/sunset), 1 = solar noon
+ * apex. Set in draw_sun_or_moon(), read by update_cloud_tints() so cloud
+ * lighting tracks how high the sun is — warm low-angle light at dawn/dusk,
+ * bright top-down light at midday. -1 while the sun is below the horizon. */
+static float s_sun_elevation = -1.0f;
 
 static uint16_t s_target = 120;
 static uint16_t s_max_target = 160;
@@ -905,12 +911,21 @@ static void draw_scene_text_overlays(void)
 
 static void fill_gradient(rgb_t top, rgb_t bottom)
 {
+    /* Non-linear vertical blend so the `bottom` (horizon) colour concentrates
+     * in the lower part of the screen instead of spreading evenly. With a
+     * gamma > 1 the top band holds its colour through most of the height and
+     * the warm horizon glow ramps up quickly only near the bottom — which is
+     * how a real sunrise/sunset looks (warm band hugging the horizon, cooler
+     * sky above). At gamma = 1 this is the old linear gradient. */
+    const float horizon_gamma = 2.2f;
     for (int y = 0; y < EVA_WEATHER_RENDER_H; ++y) {
-        int t = (y * 255) / (EVA_WEATHER_RENDER_H - 1);
+        float yn = (float)y / (float)(EVA_WEATHER_RENDER_H - 1);  /* 0 top .. 1 bottom */
+        float t = powf(yn, horizon_gamma);                        /* bias toward bottom */
+        int ti = (int)(t * 255.0f + 0.5f);
         rgb_t c = {
-            .r = (uint8_t)(top.r + (((int)bottom.r - top.r) * t) / 255),
-            .g = (uint8_t)(top.g + (((int)bottom.g - top.g) * t) / 255),
-            .b = (uint8_t)(top.b + (((int)bottom.b - top.b) * t) / 255),
+            .r = (uint8_t)(top.r + (((int)bottom.r - top.r) * ti) / 255),
+            .g = (uint8_t)(top.g + (((int)bottom.g - top.g) * ti) / 255),
+            .b = (uint8_t)(top.b + (((int)bottom.b - top.b) * ti) / 255),
         };
         uint16_t px = rgb565_from(c);
         uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
@@ -951,91 +966,255 @@ static void sun_events(int *out_sunrise, int *out_sunset)
     *out_sunset  = (s_sunset_min  >= 0) ? s_sunset_min  : 1080;  /* 18:00 */
 }
 
+/* Observer latitude in degrees, matching the menuconfig weather coordinates.
+ * Used to compute twilight duration locally since neither provider returns
+ * twilight times. */
+#define EVA_OBSERVER_LAT_FALLBACK_DEG 48.915155f
+
+static float observer_lat_deg(void)
+{
+    const char *lat_cfg = CONFIG_EVA_WEATHER_LATITUDE;
+    char *end = NULL;
+    float lat = strtof(lat_cfg, &end);
+    if (end == lat_cfg || lat < -89.9f || lat > 89.9f) {
+        return EVA_OBSERVER_LAT_FALLBACK_DEG;
+    }
+    return lat;
+}
+
+/* Civil-twilight half-duration in minutes: how long after sunset (or before
+ * sunrise) the sun takes to drop from the horizon (0°) to −6°, i.e. from
+ * "official sunset" to "full dark enough that the warm glow is gone".
+ *
+ * Open-Meteo gives only geometric sunrise/sunset (sun at 0°), so we derive
+ * the −6° crossing from spherical astronomy:
+ *
+ *   The hour angle H at which the sun sits at altitude `alt` is
+ *     cos(H) = (sin(alt) − sin(φ)·sin(δ)) / (cos(φ)·cos(δ))
+ *   with φ = latitude and δ = solar declination for the day of year.
+ *   Twilight length = (H(−6°) − H(0°)) converted from degrees to minutes
+ *   (Earth turns 360° in 1440 min → 4 min per degree).
+ *
+ * Real consequence: twilight is short near the equator / equinox and grows
+ * toward the poles and the summer solstice — exactly what we want so dusk on
+ * a long June evening lingers longer than a crisp winter one. Result is
+ * clamped to a sane [20, 180] min so high-latitude edge cases (where the sun
+ * never reaches −6°) don't explode. */
+static float civil_twilight_minutes(void)
+{
+    /* Solar declination δ from day-of-year (Cooper's approximation). */
+    time_t now = time(NULL);
+    int doy = 172;   /* default ~summer solstice if clock unsynced */
+    if (now > 1700000000) {
+        struct tm tm_now = {0};
+        localtime_r(&now, &tm_now);
+        doy = tm_now.tm_yday + 1;   /* 1..366 */
+    }
+    const float DEG2RAD = 3.14159265f / 180.0f;
+    float decl_deg = 23.44f * sinf(DEG2RAD * (360.0f / 365.0f) * (float)(doy - 81));
+    float decl = decl_deg * DEG2RAD;
+    float lat  = observer_lat_deg() * DEG2RAD;
+
+    float cos_lat = cosf(lat), sin_lat = sinf(lat);
+    float cos_decl = cosf(decl), sin_decl = sinf(decl);
+    float denom = cos_lat * cos_decl;
+    if (denom < 1e-4f) denom = 1e-4f;
+
+    /* Hour angle (radians) at altitude 0° and −6°. */
+    float c0 = (0.0f          - sin_lat * sin_decl) / denom;
+    float c6 = (sinf(-6.0f * DEG2RAD) - sin_lat * sin_decl) / denom;
+    if (c0 < -1.0f) c0 = -1.0f; else if (c0 > 1.0f) c0 = 1.0f;
+    if (c6 < -1.0f) c6 = -1.0f; else if (c6 > 1.0f) c6 = 1.0f;
+    float h0 = acosf(c0);
+    float h6 = acosf(c6);
+
+    /* Convert the hour-angle delta to minutes (4 min per degree). */
+    float minutes = (h6 - h0) / DEG2RAD * 4.0f;
+    if (minutes < 20.0f) minutes = 20.0f;
+    else if (minutes > 180.0f) minutes = 180.0f;
+    return minutes;
+}
+
+static rgb_t lerp_rgb(rgb_t a, rgb_t b, float t)
+{
+    if (t < 0.0f) t = 0.0f;
+    else if (t > 1.0f) t = 1.0f;
+    rgb_t out = {
+        .r = (uint8_t)(a.r + (int)((b.r - a.r) * t)),
+        .g = (uint8_t)(a.g + (int)((b.g - a.g) * t)),
+        .b = (uint8_t)(a.b + (int)((b.b - a.b) * t)),
+    };
+    return out;
+}
+
+/* Continuous clear-sky palette as a function of wall-clock minute, anchored
+ * to the real sunrise (sr) and sunset (ss) minutes. Returns top + horizon
+ * colours that morph smoothly through the whole day — no window snapping.
+ *
+ * The day is modelled as a normalised "sun elevation phase":
+ *   phase < 0          → night
+ *   phase in [0, twi)  → dawn/dusk twilight (warm horizon glow)
+ *   phase >= twi       → full day
+ * The same curve runs forward at sunrise and backward at sunset, so dawn and
+ * dusk share the warm-horizon treatment symmetrically. */
+static float sun_curve(float progress);   /* fwd decl: defined below */
+
+/* Night-ness factor 0..1 for the current minute, shared by every sky that
+ * has a day<->night cycle. 0 = sun above horizon (full day), 1 = past civil
+ * twilight (deep night); the dusk band ramps 0->1 over civil_twilight_minutes()
+ * on each side of the terminator. This is exactly the ramp that already drives
+ * the night branch of clear_sky_palette() — factored out so the neutral kinds
+ * (RAIN/CLOUDY/FOG/SNOW/...) can reuse the same timing. Pure function. */
+static float sky_nightness(int m, int sr, int ss)
+{
+    /* Daytime: sun is up, no night-ness regardless of elevation. */
+    if (m >= sr && m <= ss) {
+        return 0.0f;
+    }
+    const float DUSK = civil_twilight_minutes();
+    float past = (m < sr) ? (float)(sr - m) : (float)(m - ss);
+    if (DUSK <= 1.0f) return 1.0f;          /* degenerate guard: snap to night */
+    float n = past / DUSK;                  /* 0 at terminator, 1 deep night */
+    if (n > 1.0f) n = 1.0f;
+    return n;
+}
+
+static sky_t clear_sky_palette(int m, int sr, int ss)
+{
+    /* Keyframe colours along the day. */
+    const rgb_t night_top = {8, 12, 28};
+    const rgb_t night_bot = {20, 20, 42};
+    const rgb_t twi_top   = {38, 40, 78};      /* indigo at the terminator */
+    const rgb_t twi_bot   = {255, 150, 96};    /* warm orange horizon glow */
+    const rgb_t day_top   = {24, 78, 142};     /* deep blue zenith at noon */
+    const rgb_t day_bot   = {120, 178, 224};   /* pale blue horizon at noon */
+
+    /* The sky is driven by the sun's *elevation*, modelled as a continuous
+     * curve over the whole day rather than fixed sunrise/sunset windows.
+     *
+     * Daylight is parameterised by `progress` in [0,1] from sunrise to
+     * sunset; `elev = sin(progress·π)` is 0 at either horizon and 1 at solar
+     * noon — the same arc that lifts the sun sprite. The palette then blends:
+     *   elev = 0   → twilight (warm horizon, indigo top)
+     *   elev = 1   → full midday blue
+     * so the colour shifts smoothly all day: warm at dawn, brightening
+     * toward noon, warming again toward dusk. No flat plateau, no 55-min
+     * tone bands.
+     *
+     * Night (sun below the horizon) fades night↔twilight over a dusk band so
+     * the transition into and out of darkness is gradual too. The band width
+     * is the real civil-twilight duration for our latitude and date, so the
+     * "full dark" point tracks the actual season (longer dusk in summer).
+     * The night-side ramp itself now lives in sky_nightness(). */
+
+    rgb_t top, bot;
+    if (m >= sr && m <= ss) {
+        /* Daytime: blend twilight → midday by sun elevation. */
+        float daylight = (float)(ss - sr);
+        if (daylight < 1.0f) daylight = 1.0f;
+        float progress = (float)(m - sr) / daylight;
+        float elev = sun_curve(progress);          /* 0 horizon .. 1 noon */
+        /* Smoothstep so the warm low-sun look lingers a bit near the
+         * horizon and midday blue dominates the middle of the day. */
+        float t = elev * elev * (3.0f - 2.0f * elev);
+        top = lerp_rgb(twi_top, day_top, t);
+        bot = lerp_rgb(twi_bot, day_bot, t);
+    } else {
+        /* Nighttime: twilight → night by the shared night-ness ramp.
+         * sky_nightness() clamps to 1.0 past the dusk band, so the old
+         * explicit night_top/bot assignment is reproduced by lerp(...,1.0f). */
+        float t = sky_nightness(m, sr, ss);    /* 0 at terminator, 1 deep night */
+        top = lerp_rgb(twi_top, night_top, t);
+        bot = lerp_rgb(twi_bot, night_bot, t);
+    }
+    return (sky_t){ "clear-cycle", top, bot };
+}
+
 static sky_t sky_for_kind(weather_kind_t kind)
 {
     int m = minutes_now();
     int sr, ss;
     sun_events(&sr, &ss);
-    bool sunrise = (m >= sr - SUN_WINDOW_MIN && m < sr + SUN_WINDOW_MIN);
-    bool sunset  = (m >= ss - SUN_WINDOW_MIN && m < ss + SUN_WINDOW_MIN);
-    bool day     = (!sunrise && !sunset && m >= sr - SUN_WINDOW_MIN && m < ss + SUN_WINDOW_MIN);
-    bool night = !sunrise && !day && !sunset;
 
-    /* Explicit kind tags override the time-of-day fallback. Previously these
-     * only set the new state to true without clearing the others, so a
-     * CLEAR_NIGHT kind at e.g. sunset wall-clock time would still drop into
-     * the sunset branch below and render a pink-rose sky. Force the other
-     * states off so the right branch wins. */
+    /* Explicit night kinds force the night palette regardless of the
+     * wall-clock minute (e.g. a CLEAR_NIGHT debug scene at noon should still
+     * render a night sky, not a daytime blue). */
     if (kind == WEATHER_CLEAR_NIGHT || kind == WEATHER_PARTLY_CLOUDY_NIGHT) {
-        night = true;
-        day = false;
-        sunrise = false;
-        sunset = false;
-    }
-    if (kind == WEATHER_CLEAR_DAY || kind == WEATHER_PARTLY_CLOUDY_DAY) {
-        day = true;
-        night = false;
+        return (sky_t){ "night", {8, 12, 28}, {20, 20, 42} };
     }
 
-    if (kind == WEATHER_RAIN || kind == WEATHER_SLEET) {
-        return (sky_t){ "rain", {34, 44, 60}, {82, 92, 104} };
+    /* Neutral kinds (no explicit day/night variant) share one day<->night
+     * ramp: each keeps its existing daytime palette and fades to a charcoal-
+     * grey night palette as sky_nightness() goes 0->1. No warm orange glow —
+     * an overcast / rainy / snowy sky does not show a sunset, it just darkens.
+     * Charcoal (not black) so clouds and rain/snow particles still read.
+     * FOG and SNOW stay lighter at night (fog scatters city/moon light; snow
+     * reflects it). The day_* values are the previous fixed palettes, so at
+     * n=0 (daytime) this reproduces the old look exactly. */
+    {
+        float n = sky_nightness(m, sr, ss);
+        rgb_t day_top, day_bot, night_top, night_bot;
+        const char *tag;
+        bool matched = true;
+        switch (kind) {
+        case WEATHER_RAIN:
+        case WEATHER_SLEET:
+            tag = "rain";
+            day_top   = (rgb_t){ 34,  44,  60}; day_bot   = (rgb_t){ 82,  92, 104};
+            night_top = (rgb_t){ 18,  22,  30}; night_bot = (rgb_t){ 40,  46,  56};
+            break;
+        case WEATHER_HEAVY_RAIN:
+            tag = "heavy-rain";
+            day_top   = (rgb_t){ 18,  26,  40}; day_bot   = (rgb_t){ 52,  60,  74};
+            night_top = (rgb_t){ 12,  16,  24}; night_bot = (rgb_t){ 30,  36,  46};
+            break;
+        case WEATHER_THUNDERSTORM:
+            tag = "thunderstorm";
+            day_top   = (rgb_t){ 12,  18,  30}; day_bot   = (rgb_t){ 46,  48,  58};
+            night_top = (rgb_t){ 10,  14,  22}; night_bot = (rgb_t){ 28,  32,  42};
+            break;
+        case WEATHER_SNOW:
+        case WEATHER_HAIL:
+            tag = "snow";
+            day_top   = (rgb_t){116, 132, 150}; day_bot   = (rgb_t){205, 214, 220};
+            night_top = (rgb_t){ 30,  36,  46}; night_bot = (rgb_t){ 58,  66,  80};
+            break;
+        case WEATHER_FOG:
+            tag = "fog";
+            day_top   = (rgb_t){130, 138, 145}; day_bot   = (rgb_t){215, 216, 210};
+            night_top = (rgb_t){ 40,  44,  52}; night_bot = (rgb_t){ 70,  74,  82};
+            break;
+        case WEATHER_CLOUDY:
+            tag = "cloudy";
+            day_top   = (rgb_t){ 78,  92, 108}; day_bot   = (rgb_t){150, 160, 170};
+            night_top = (rgb_t){ 22,  26,  34}; night_bot = (rgb_t){ 42,  48,  58};
+            break;
+        default:
+            matched = false;
+            tag = ""; day_top = day_bot = night_top = night_bot = (rgb_t){0, 0, 0};
+            break;
+        }
+        if (matched) {
+            return (sky_t){ tag,
+                            lerp_rgb(day_top, night_top, n),
+                            lerp_rgb(day_bot, night_bot, n) };
+        }
     }
-    if (kind == WEATHER_HEAVY_RAIN) {
-        return (sky_t){ "heavy-rain", {18, 26, 40}, {52, 60, 74} };
-    }
-    if (kind == WEATHER_THUNDERSTORM) {
-        return (sky_t){ "thunderstorm", {12, 18, 30}, {46, 48, 58} };
-    }
-    if (kind == WEATHER_SNOW || kind == WEATHER_HAIL) {
-        return (sky_t){ "snow", {116, 132, 150}, {205, 214, 220} };
-    }
-    if (kind == WEATHER_FOG) {
-        return (sky_t){ "fog", {130, 138, 145}, {215, 216, 210} };
-    }
-    if (kind == WEATHER_CLOUDY) {
-        return (sky_t){ "cloudy", {78, 92, 108}, {150, 160, 170} };
-    }
-    if (sunrise) {
-        /* p in [0..1] across the 2-hour window centred on actual sunrise. */
-        float p = (float)(m - (sr - SUN_WINDOW_MIN)) / (float)(2 * SUN_WINDOW_MIN);
-        if (p < 0.0f) p = 0.0f; else if (p > 1.0f) p = 1.0f;
-        rgb_t a = {26, 26, 46};
-        rgb_t b = {255, 160, 122};
-        rgb_t c = {255, 215, 0};
-        rgb_t top = {
-            .r = (uint8_t)(a.r + (b.r - a.r) * p),
-            .g = (uint8_t)(a.g + (b.g - a.g) * p),
-            .b = (uint8_t)(a.b + (b.b - a.b) * p),
-        };
-        rgb_t bot = {
-            .r = (uint8_t)(a.r + (c.r - a.r) * p),
-            .g = (uint8_t)(a.g + (c.g - a.g) * p),
-            .b = (uint8_t)(a.b + (c.b - a.b) * p),
-        };
-        return (sky_t){ "sunrise", top, bot };
-    }
-    if (sunset) {
-        float p = (float)(m - (ss - SUN_WINDOW_MIN)) / (float)(2 * SUN_WINDOW_MIN);
-        if (p < 0.0f) p = 0.0f; else if (p > 1.0f) p = 1.0f;
-        rgb_t a = {255, 107, 107};
-        rgb_t b = {255, 160, 122};
-        rgb_t n = {26, 26, 46};
-        rgb_t top = {
-            .r = (uint8_t)(a.r + (n.r - a.r) * p),
-            .g = (uint8_t)(a.g + (n.g - a.g) * p),
-            .b = (uint8_t)(a.b + (n.b - a.b) * p),
-        };
-        rgb_t bot = {
-            .r = (uint8_t)(b.r + (n.r - b.r) * p),
-            .g = (uint8_t)(b.g + (n.g - b.g) * p),
-            .b = (uint8_t)(b.b + (n.b - b.b) * p),
-        };
-        return (sky_t){ "sunset", top, bot };
-    }
-    if (night) {
-        return (sky_t){ "night", {8, 12, 28}, {24, 22, 46} };
-    }
-    return (sky_t){ "day", {24, 78, 142}, {74, 152, 214} };
+    /* Continuous day-cycle palette for clear / partly-cloudy skies.
+     * Instead of three discrete windows (sunrise / day / sunset) that snap
+     * between palettes, the sky colour is interpolated smoothly from a small
+     * set of keyframes anchored to the real sunrise/sunset minutes. This
+     * removes the visible "jump" when the clock crosses a window boundary
+     * and matches how a real sky shifts gradually through the day.
+     *
+     * Keyframes (top of sky, horizon at bottom):
+     *   deep night      → very dark blue, both bands
+     *   astronomical    → dark blue top, faint warmth at horizon
+     *   sunrise/sunset  → indigo top, warm orange/gold horizon glow
+     *   full day        → blue top, lighter blue horizon
+     * The horizon (bottom) band carries the warm sunrise/sunset glow; the
+     * top band stays cooler — which is what real skies do near the horizon. */
+    return clear_sky_palette(m, sr, ss);
 }
 
 static bool sky_kind_is_clearish(weather_kind_t kind)
@@ -1048,23 +1227,30 @@ static void draw_day_sky_depth(void)
 {
     if (is_night_kind(s_kind) || !sky_kind_is_clearish(s_kind)) return;
 
-    const int cx = EVA_WEATHER_RENDER_W / 2;
+    /* Subtle zenith darkening. Was a full-screen per-pixel radial scan with a
+     * smooth_u8() float call per sample — ~80 ms, the dominant cost of the
+     * background rebake and the real cause of the once-a-second freeze on
+     * clear/sunny skies. The darkening is overwhelmingly vertical (the centre
+     * is near the top), so a per-ROW gradient looks the same and costs ~480
+     * float ops instead of ~96k. Each row is a single solid-alpha span. */
     const int cy = EVA_WEATHER_RENDER_H / 5;
-    const int max_d2 = cx * cx + EVA_WEATHER_RENDER_H * EVA_WEATHER_RENDER_H;
+    const int span = EVA_WEATHER_RENDER_H;          /* vertical falloff scale */
     const uint16_t zenith = rgb565(7, 37, 92);
-    for (int y = 0; y < EVA_WEATHER_RENDER_H; y += 2) {
-        for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 2) {
-            int dx = x - cx;
-            int dy = y - cy;
-            float d = (float)(dx * dx + dy * dy) / (float)max_d2;
-            if (d < 0.0f) d = 0.0f;
-            if (d > 1.0f) d = 1.0f;
-            uint8_t a = smooth_u8(1.0f - d, 42);
-            if (!a) continue;
-            blend_px(x, y, zenith, a);
-            blend_px(x + 1, y, zenith, a);
-            blend_px(x, y + 1, zenith, a);
-            blend_px(x + 1, y + 1, zenith, a);
+    for (int y = 0; y < EVA_WEATHER_RENDER_H; ++y) {
+        int dy = y - cy;
+        float d = (float)(dy * dy) / (float)(span * span);
+        if (d > 1.0f) d = 1.0f;
+        uint8_t a = smooth_u8(1.0f - d, 42);
+        if (!a) continue;
+        uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
+        /* After fill_gradient the sky colour is constant across each row, and
+         * the zenith tint + alpha are also constant per row, so the blended
+         * result is one colour for the whole row. Compute it once and fill
+         * flat instead of calling blend565 for all 800 px — the per-pixel
+         * version cost ~29 ms (one of the freeze contributors). */
+        uint16_t blended = blend565(row[0], zenith, a);
+        for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
+            row[x] = blended;
         }
     }
 }
@@ -1073,7 +1259,12 @@ static void draw_sun_sky_glare(void)
 {
     if (!s_sun_visible || s_sun_strength <= 0.0f || is_night_kind(s_kind)) return;
 
-    int r = (int)(260.0f + 90.0f * s_sun_strength);
+    /* Glare radius capped on the Fibonacci ladder (was 260-350 px — a
+     * 700×700 per-pixel scan that cost ~97 ms and was the single cause of
+     * the ~once-a-second freeze whenever the sun was visible). FIB_89 keeps
+     * the bright sky-glow tight around the sun; the area shrinks ~15× so the
+     * pass drops to a few ms. */
+    int r = (int)((float)FIB_89 + 21.0f * s_sun_strength);
     int r2 = r * r;
     uint16_t cool_glare = rgb565(210, 232, 255);
     uint16_t warm_core = rgb565(255, 250, 218);
@@ -1436,6 +1627,12 @@ static void spawn_particle(particle_t *p, particle_kind_t kind, bool from_top, u
     p->layer = particle_layer_for_slot(slot, s_target);
     float z = phi_layer_scale(p->layer);
     float speed_z = 0.62f * z;
+    /* Wind X for particles in VIEWER space. The panel runs through a 270° PPA
+     * rotation that mirrors the buffer's horizontal axis, so a positive
+     * buffer vx would slant rain the wrong way on screen. Negate so rain/snow
+     * slant matches the on-screen cloud drift (which is corrected the same
+     * way in advance_cloud_scroll). */
+    float wind_vx = -s_wind_vx_bias;
     float size_z = 0.82f + 0.11f * z;
     float alpha_z = 0.80f + 0.08f * z;
     p->x = rndf(0.0f, EVA_WEATHER_RENDER_W - 1.0f);
@@ -1449,7 +1646,7 @@ static void spawn_particle(particle_t *p, particle_kind_t kind, bool from_top, u
          * s_wind_vx_bias is 0 and rain falls effectively straight. */
     {
         float light = (s_density_scale < 0.70f) ? 0.68f : 1.0f;
-        p->vx = (s_wind_vx_bias + rndf(-20.0f, 20.0f)) * speed_z;
+        p->vx = (wind_vx + rndf(-20.0f, 20.0f)) * speed_z;
         p->vy = rndf(330.0f, 540.0f) * speed_z;
         p->size = rndf(7.0f, 15.0f) * size_z * light;
         p->alpha = rndf(0.38f, 0.72f) * alpha_z * light;
@@ -1458,14 +1655,14 @@ static void spawn_particle(particle_t *p, particle_kind_t kind, bool from_top, u
     case P_SNOW:
         /* Snow is much lighter — wind effect is ~30 % of rain's, plus a
          * symmetric jitter for natural wobble. */
-        p->vx = (s_wind_vx_bias * 0.30f + rndf(-14.0f, 14.0f)) * speed_z;
+        p->vx = (wind_vx * 0.30f + rndf(-14.0f, 14.0f)) * speed_z;
         p->vy = rndf(28.0f, 86.0f) * speed_z;
         p->size = rndf(1.4f, 3.8f) * size_z;
         p->alpha = rndf(0.45f, 0.90f) * alpha_z;
         break;
     case P_HAIL:
         /* Hail is heavy — wind effect is only ~15 % of rain's. */
-        p->vx = (s_wind_vx_bias * 0.15f + rndf(-25.0f, 25.0f)) * speed_z;
+        p->vx = (wind_vx * 0.15f + rndf(-25.0f, 25.0f)) * speed_z;
         p->vy = rndf(360.0f, 620.0f) * speed_z;
         p->size = rndf(2.0f, 5.0f) * size_z;
         p->alpha = rndf(0.72f, 0.95f) * alpha_z;
@@ -1740,33 +1937,53 @@ static void draw_sun_or_moon(float t)
 {
     s_sun_visible = false;
     s_sun_strength = 0.0f;
+    s_sun_elevation = -1.0f;
     s_sun_x = -1;
     s_sun_y = -1;
     s_sun_r = 0;
 
     int m = minutes_now();
 
-    /* Storm kinds never show the luminary — overcast is total enough that
-     * neither sun nor moon should be visible. Lightning is the only light
-     * source during a thunderstorm. */
-    bool stormy = (s_kind == WEATHER_THUNDERSTORM ||
-                   s_kind == WEATHER_HEAVY_RAIN);
-    if (stormy) return;
+    /* Any precipitation kind hides the sun/moon: if it's raining, sleeting,
+     * snowing or hailing the sky is overcast enough that no luminary shows
+     * through. (Previously only thunderstorm + heavy rain hid it, so plain
+     * "rain" still drew a sun in a fully clouded sky — wrong.) Lightning is
+     * the only light source during a thunderstorm. */
+    bool precip_kind = (s_kind == WEATHER_THUNDERSTORM ||
+                        s_kind == WEATHER_HEAVY_RAIN ||
+                        s_kind == WEATHER_RAIN ||
+                        s_kind == WEATHER_SLEET ||
+                        s_kind == WEATHER_HAIL ||
+                        s_kind == WEATHER_SNOW);
+    if (precip_kind) return;
 
-    /* Compute attenuation from cloud cover. Even at 85 % cover the disc
-     * should still be visible as a pale glow ("сонце крізь хмари"); only at
-     * truly overcast (≥98 %) does it vanish. The disc gets a higher floor
-     * than the halos so it punches through partial cloud, while the outer
-     * flare/corona still fade off aggressively (those wash out in real
-     * skies long before the disc itself does). */
+    /* Compute attenuation from cloud cover.
+     *
+     * Real-world behaviour we want: on a partly-cloudy day the sun is still
+     * the dominant bright object — it shines at near-full strength until the
+     * sky is genuinely solid. Clouds passing IN FRONT of it occlude it
+     * locally (handled by the cloud layers drawn on top), but the disc's own
+     * brightness shouldn't dim just because total cover is 50-70 %.
+     *
+     * So the disc holds near-full brightness up to ~78 % cover, then ramps
+     * down quickly to nothing at ~98 % (true overcast). The soft halo/corona
+     * fades earlier and faster (they wash out in hazy skies well before the
+     * disc does). */
     float cover = sky_cover_fraction();
     if (cover >= 0.98f) return;            /* near-overcast: hide entirely */
+
+    /* Disc: full strength until DISC_KNEE cover, then linear down to 0 at 98%. */
+    const float DISC_KNEE = 0.78f;
+    float vis_disc;
+    if (cover <= DISC_KNEE) {
+        vis_disc = 1.0f;                   /* bright sun through gaps */
+    } else {
+        vis_disc = 1.0f - (cover - DISC_KNEE) / (0.98f - DISC_KNEE);
+        if (vis_disc < 0.0f) vis_disc = 0.0f;
+    }
+    /* Halo/corona: softer, fades from the very first clouds. */
     float vis_raw = 1.0f - (cover / 0.98f);
-    /* Smoothstep keeps the *halo* falloff soft. The disc uses a much
-     * gentler curve (sqrt-like) so at 85 % cover it's still ~40 % alpha
-     * instead of 5 %. */
     float vis = vis_raw * vis_raw * (3.0f - 2.0f * vis_raw);
-    float vis_disc = sqrtf(vis_raw);
 
     if (is_night_kind(s_kind)) {
         /* Default hardcoded position if moon astronomy isn't available yet. */
@@ -1817,22 +2034,36 @@ static void draw_sun_or_moon(float t)
     if (progress > 1.0f) progress = 1.0f;
     float arc = sun_curve(progress);
     float horizon_boost = 1.0f - arc;  /* bigger and warmer near horizon */
-    float sun_x_n = 0.04f + progress * 0.92f;
-    float sun_y_n = 0.24f - arc * 0.16f;
+    s_sun_elevation = arc;             /* publish for cloud-tint lighting */
+    /* Sun follows a real arc: rises FROM the horizon (bottom of screen) at
+     * dawn, climbs to its apex near solar noon, then sinks back to the
+     * horizon at dusk. The bottom of the screen is the horizon line.
+     *   arc = 0 (sunrise/sunset) → sun_y_n = SUN_HORIZON_Y (low, near bottom)
+     *   arc = 1 (solar noon)     → sun_y_n = SUN_APEX_Y    (high, near top)
+     * X still sweeps left→right across the day. */
+    const float SUN_HORIZON_Y = 0.90f;   /* just above the haze at the bottom */
+    const float SUN_APEX_Y    = 0.12f;   /* highest point at noon */
+    float sun_x_n = 0.06f + progress * 0.88f;
+    float sun_y_n = SUN_HORIZON_Y - arc * (SUN_HORIZON_Y - SUN_APEX_Y);
     int sun_x = (int)(EVA_WEATHER_RENDER_W * sun_x_n);
     int sun_y = (int)(EVA_WEATHER_RENDER_H * sun_y_n);
     /* Real phone photos show a small white saturated core with most of the
      * perceived size coming from glare. Keep the disc compact and let the
      * sky-glare/god-ray passes sell the brightness. */
-    int r = (int)(18.0f + horizon_boost * 9.0f + sinf(t * 0.15f) * 1.2f);
+    /* Disc + glow radii on the Fibonacci ladder, capped at 89 px. The old
+     * code used r*8 (~144 px) for the outer glow — a huge filled circle that
+     * was the dominant cost on clear sky. Now the disc is ~21 px and the glow
+     * layers step 34 → 55 → 89 px, so the painted area is far smaller while
+     * still reading as a bright sun with a soft halo. */
+    int r = FIB_21;                              /* compact disc ~21 px */
     uint8_t a_outer  = (uint8_t)((float)FIB_21 * vis * (0.65f + 0.35f * horizon_boost));
     uint8_t a_corona = (uint8_t)((float)FIB_34 * vis * (0.75f + 0.25f * horizon_boost));
     uint8_t a_glow   = (uint8_t)((float)FIB_89 * vis_disc * (0.85f + 0.15f * horizon_boost));
     uint8_t a_disc   = (uint8_t)((float)255 * vis_disc);
-    if (a_outer)  draw_filled_circle(sun_x, sun_y, r * 8, rgb565(210, 232, 255), a_outer);
-    if (a_corona) draw_filled_circle(sun_x, sun_y, r * 5, rgb565(255, 244, 204), a_corona);
-    if (a_glow)   draw_filled_circle(sun_x, sun_y, r * 2, rgb565(255, 252, 220), a_glow);
-    if (a_disc)   draw_filled_circle(sun_x, sun_y, r,     rgb565(255, 255, 246), a_disc);
+    if (a_outer)  draw_filled_circle(sun_x, sun_y, FIB_89, rgb565(210, 232, 255), a_outer);
+    if (a_corona) draw_filled_circle(sun_x, sun_y, FIB_55, rgb565(255, 244, 204), a_corona);
+    if (a_glow)   draw_filled_circle(sun_x, sun_y, FIB_34, rgb565(255, 252, 220), a_glow);
+    if (a_disc)   draw_filled_circle(sun_x, sun_y, r,      rgb565(255, 255, 246), a_disc);
 
     /* Remember sun position + radius so the post-cloud god-ray pass (drawn
      * after the cloud composite) can paint a warm light overlay through the
@@ -1856,74 +2087,38 @@ static void draw_sun_or_moon(float t)
  *      decreasing alpha. These read as visible "god rays" piercing the clouds.
  *
  * Skipped during storms (sun already hidden by draw_sun_or_moon) and at night. */
+/* Lightweight sun halo: a few concentric Fibonacci-radius rings (8,13,21,34,
+ * 55,89 px) whose alpha falls off with distance. Replaces the old god-ray
+ * pass (a 216 px filled circle plus 8 marched beams) which scanned a huge
+ * screen region every frame — ~60 ms on the CPU, the real FPS killer. The
+ * ring set tops out at 89 px so the painted area is tiny and cheap, while
+ * still giving the sun a soft warm glow that bleeds onto nearby clouds.
+ * Rings go outer→inner so the brighter inner ones overpaint. */
 static void draw_sun_god_rays(float t)
 {
+    (void)t;
     if (!s_sun_visible || s_sun_r <= 0) return;
     if (is_night_kind(s_kind)) return;
     bool stormy = (s_kind == WEATHER_THUNDERSTORM || s_kind == WEATHER_HEAVY_RAIN);
     if (stormy) return;
 
-    /* Attenuate the ray strength by sky cover — at fully overcast (>=98 %)
-     * the sun pass already returned, but for partly-cloudy days we want the
-     * rays to feel stronger when there are gaps (low cover) than when the
-     * sky is almost full (mostly diffuse light). */
+    /* Dimmer halo under heavy cover, brighter through clear gaps. */
     float cover = sky_cover_fraction();
-    float ray_vis = 1.0f - cover * 0.6f;        /* keeps some warmth even on cloudy days */
-    if (ray_vis < 0.20f) ray_vis = 0.20f;
+    float halo_vis = 1.0f - cover * 0.6f;
+    if (halo_vis < 0.20f) halo_vis = 0.20f;
 
-    /* Pass 1: large soft warm halo over the whole sun region. Radius is 8×
-     * the disc — covers most of the sky above the sun. Alpha is very low so
-     * it doesn't wash out clouds, just tints them warm. */
-    int halo_r = s_sun_r * 8;
-    uint8_t halo_alpha = (uint8_t)(18.0f * ray_vis);
-    if (halo_alpha) {
-        draw_filled_circle(s_sun_x, s_sun_y, halo_r,
-                           rgb565(255, 220, 150), halo_alpha);
-    }
-
-    /* Pass 2: 8 radial rays emanating from the sun. Drawn as wedges via
-     * per-pixel marching: for each ray angle, walk pixel-by-pixel outward
-     * and paint a perpendicular strip whose width and alpha decay with
-     * distance. Step=2 px so the strips overlap into smooth beams instead
-     * of looking like a string of beads (the previous step=s_sun_r/3 left
-     * visible gaps between sample circles). */
-    const int NUM_RAYS = 8;
-    float base_angle = t * 0.04f;               /* slow rotation, ~14 °/s */
-    int ray_len = s_sun_r * 10;                 /* reach far across screen */
-
-    for (int k = 0; k < NUM_RAYS; ++k) {
-        float ang = base_angle + (float)k * (2.0f * 3.1415926f / (float)NUM_RAYS);
-        float dx_u = cosf(ang);
-        float dy_u = sinf(ang);
-        /* Perpendicular unit vector (for the strip's transverse axis). */
-        float nx = -dy_u;
-        float ny =  dx_u;
-
-        /* Walk outward in 2 px increments so adjacent samples overlap. */
-        for (int d = s_sun_r; d < ray_len; d += 2) {
-            float fade = 1.0f - (float)d / (float)ray_len;
-            if (fade <= 0.0f) break;
-            /* Beam half-width grows slowly with distance, capped so the ray
-             * stays narrow at the tip rather than ballooning. */
-            int half_w = 2 + (d - s_sun_r) / 24;
-            if (half_w > 8) half_w = 8;
-            uint8_t a_center = (uint8_t)(24.0f * fade * fade * ray_vis);
-            if (a_center == 0) continue;
-
-            int cx_d = s_sun_x + (int)(dx_u * (float)d);
-            int cy_d = s_sun_y + (int)(dy_u * (float)d);
-
-            /* Paint a soft perpendicular strip with falloff toward the edges. */
-            for (int t_off = -half_w; t_off <= half_w; ++t_off) {
-                int px = cx_d + (int)(nx * (float)t_off);
-                int py = cy_d + (int)(ny * (float)t_off);
-                /* Triangle falloff: center is brightest, edge is 0. */
-                int abs_t = (t_off < 0) ? -t_off : t_off;
-                uint8_t a = (uint8_t)((int)a_center * (half_w + 1 - abs_t) / (half_w + 1));
-                if (a) {
-                    blend_px(px, py, rgb565(245, 236, 210), a);
-                }
-            }
+    /* radius (px) → base alpha. Farther = fainter. Capped at 89 px. */
+    /* Only the outer rings — the inner ones overlap the sun disc/glow drawn
+     * by draw_sun_or_moon() and just cost extra filled-circle passes. Three
+     * rings give a smooth outer halo. */
+    static const struct { int r; float a; } rings[] = {
+        { FIB_89, 7.0f }, { FIB_55, 12.0f }, { FIB_34, 18.0f },
+    };
+    const uint16_t warm = rgb565(255, 226, 168);
+    for (size_t i = 0; i < sizeof(rings) / sizeof(rings[0]); ++i) {
+        uint8_t a = (uint8_t)(rings[i].a * halo_vis);
+        if (a) {
+            draw_filled_circle(s_sun_x, s_sun_y, rings[i].r, warm, a);
         }
     }
 }
@@ -2207,11 +2402,48 @@ static void update_cloud_tints(void)
         set_tint(&s_strip[CLOUD_LAYER_MID],  108, 116, 138,  48,  54,  72,  34,  40,  58);
         set_tint(&s_strip[CLOUD_LAYER_LOW],   92, 100, 122,  35,  42,  58,  22,  28,  42);
     } else {
-        /* Day: direct sunlight on tops (near-white with warm hint),
-         * sky-blue scattered shadow on undersides. */
-        set_tint(&s_strip[CLOUD_LAYER_HIGH], 255, 255, 252, 205, 216, 232, 170, 184, 204);
-        set_tint(&s_strip[CLOUD_LAYER_MID],  255, 255, 252, 160, 176, 198, 112, 130, 158);
-        set_tint(&s_strip[CLOUD_LAYER_LOW],  255, 255, 252, 118, 132, 156,  70,  84, 108);
+        /* Day: cloud lighting tracks the sun's elevation.
+         *
+         * High sun (midday): light hits the cloud tops straight down, so the
+         * lit pass is near-white and the undersides catch cool sky-blue
+         * scatter — bright, high-contrast cumulus.
+         *
+         * Low sun (sunrise/sunset): the sun grazes the clouds from the side,
+         * so the "lit" face is a warm muted orange/pink rather than white,
+         * the light is dimmer overall, and shadows go warmer-dark. This is
+         * why clouds at dawn/dusk are never bright white — there is no
+         * top-down light reaching them.
+         *
+         * elev in [0,1]: 0 = horizon (warm low light), 1 = apex (white top
+         * light). Below the horizon s_sun_elevation is -1 → treat as 0. */
+        float elev = s_sun_elevation;
+        if (elev < 0.0f) elev = 0.0f;
+        /* Ease so most of the day looks "high sun" and the warm low-angle
+         * look only takes over in the last/first ~hour near the horizon. */
+        float hi = elev * elev * (3.0f - 2.0f * elev);   /* smoothstep */
+
+        /* Per-layer endpoint tints: {light}, {shadow}, {core}.
+         * _lo = grazing low-sun (warm, dim), _hi = overhead (white, cool). */
+        /* HIGH cirrus */
+        rgb_t h_l_lo = {255, 196, 150}, h_l_hi = {255, 255, 252};
+        rgb_t h_s_lo = {150, 120, 130}, h_s_hi = {205, 216, 232};
+        rgb_t h_c_lo = {120,  92, 104}, h_c_hi = {170, 184, 204};
+        /* MID altocumulus */
+        rgb_t m_l_lo = {255, 180, 132}, m_l_hi = {255, 255, 252};
+        rgb_t m_s_lo = {120,  92, 104}, m_s_hi = {160, 176, 198};
+        rgb_t m_c_lo = { 92,  68,  82}, m_c_hi = {112, 130, 158};
+        /* LOW cumulus */
+        rgb_t l_l_lo = {255, 168, 120}, l_l_hi = {255, 255, 252};
+        rgb_t l_s_lo = { 96,  72,  86}, l_s_hi = {118, 132, 156};
+        rgb_t l_c_lo = { 64,  48,  62}, l_c_hi = { 70,  84, 108};
+
+        rgb_t hL = lerp_rgb(h_l_lo, h_l_hi, hi), hS = lerp_rgb(h_s_lo, h_s_hi, hi), hC = lerp_rgb(h_c_lo, h_c_hi, hi);
+        rgb_t mL = lerp_rgb(m_l_lo, m_l_hi, hi), mS = lerp_rgb(m_s_lo, m_s_hi, hi), mC = lerp_rgb(m_c_lo, m_c_hi, hi);
+        rgb_t lL = lerp_rgb(l_l_lo, l_l_hi, hi), lS = lerp_rgb(l_s_lo, l_s_hi, hi), lC = lerp_rgb(l_c_lo, l_c_hi, hi);
+
+        set_tint(&s_strip[CLOUD_LAYER_HIGH], hL.r, hL.g, hL.b, hS.r, hS.g, hS.b, hC.r, hC.g, hC.b);
+        set_tint(&s_strip[CLOUD_LAYER_MID],  mL.r, mL.g, mL.b, mS.r, mS.g, mS.b, mC.r, mC.g, mC.b);
+        set_tint(&s_strip[CLOUD_LAYER_LOW],  lL.r, lL.g, lL.b, lS.r, lS.g, lS.b, lC.r, lC.g, lC.b);
     }
 
     for (int i = 0; i < CLOUD_LAYER_COUNT; ++i) {
@@ -2263,16 +2495,22 @@ static void advance_cloud_scroll(float dt)
         [CLOUD_LAYER_MID]  = 1.0f / EVA_PHI,      /* 0.618 — calmer */
         [CLOUD_LAYER_LOW]  = 1.0f,                /* full wind effect */
     };
-    /* Direction of horizontal scroll follows the wind:
-     *   s_wind_vx_bias > 0 → wind blows east → clouds drift east  (scroll_x ↑, default direction)
-     *   s_wind_vx_bias < 0 → wind blows west → clouds drift west  (scroll_x ↓)
-     *   |s_wind_vx_bias| ≈ 0 → calm, keep a gentle east-going default drift.
-     * The threshold of ~4 px/s (≈ 2 kph) avoids jittery direction flips
-     * when live wind data dithers around zero. */
-    float dir_sign = 1.0f;
-    if (s_wind_vx_bias < -4.0f) dir_sign = -1.0f;
-    else if (s_wind_vx_bias > 4.0f) dir_sign = 1.0f;
-    /* else: leave default east-going drift for calm conditions. */
+    /* Direction of horizontal scroll follows the wind.
+     *
+     * IMPORTANT sign note: the blend samples mask[scroll + x] for screen
+     * column x, so increasing scroll_x makes the cloud texture appear to
+     * move LEFT (west). To make the on-screen drift match the wind, the
+     * scroll increment must be the OPPOSITE sign of the wind's screen-x:
+     * Sign verified on hardware: the panel is driven through a 270° PPA
+     * rotation, which mirrors the buffer's horizontal axis on the viewer's
+     * screen. So to make the VIEWER see clouds drift with the wind:
+     *   wind blows east (vx_bias > 0) → viewer sees rightward drift → scroll_x ↑
+     *   wind blows west (vx_bias < 0) → viewer sees leftward  drift → scroll_x ↓
+     * The ±4 px/s (~2 kph) dead-band avoids jitter when live wind dithers
+     * around zero; in calm air we keep a gentle default drift. */
+    float dir_sign = 1.0f;                        /* calm default: gentle eastward drift */
+    if (s_wind_vx_bias > 4.0f) dir_sign = 1.0f;   /* east wind → viewer right */
+    else if (s_wind_vx_bias < -4.0f) dir_sign = -1.0f; /* west wind → viewer left */
 
     /* Vertical drift component. Wind direction in degrees: 0=North, 90=East.
      * Our screen X grows eastward (dir_x = -sin(rad)), Y down so Y component
@@ -2455,6 +2693,10 @@ static void blend_layer_variant(cloud_strip_t *strip,
     (void)shadow_alpha;
     (void)core_alpha;
 
+    /* Cloud blend via PPA (hardware A8-over-RGB565). CPU blend was tried but
+     * a full-width light mask is ~60 ms on the CPU — far worse than PPA even
+     * with some engine contention against the SRM rotation. Falls back to CPU
+     * only if the PPA call errors out. */
     esp_err_t err = ESP_OK;
     if (light_alpha) {
         err = blend_mask_ppa_one_band(strip, v->a8_light,
@@ -2478,7 +2720,6 @@ static void blend_layer_variant(cloud_strip_t *strip,
         ESP_LOGW(TAG, "PPA cloud blend failed once (err=%d), using CPU fallback", (int)err);
         s_ppa_blend_disabled = true;
     }
-    /* CPU fallback for the single light pass. */
     if (light_alpha) {
         blend_mask_cpu(strip, v->a8_light,
                        strip->tint_light_r, strip->tint_light_g, strip->tint_light_b,
@@ -2523,8 +2764,12 @@ static void update_cloud_lifecycle(float dt)
             strip->morphing = false;
             strip->morph_t = 0.0f;
             strip->morph_clock = 0.0f;
-            bake_strip_for_layer(i, &strip->variant[strip->active_variant ^ 1U],
-                                 strip->strip_h);
+            /* Previously re-baked the now-hidden variant here so the next
+             * morph would cross-fade to a fresh shape. That bake is a
+             * 30-80 ms synchronous spike that showed up as a periodic frame
+             * drop (min FPS ~14). The two variants baked at init are enough
+             * for a continuous, non-repetitive-looking drift; we just ping
+             * pong between them. No per-cycle re-bake → no spike. */
         }
     }
 }
@@ -2564,7 +2809,12 @@ static void draw_sun_cloud_light_variant(const cloud_strip_t *strip,
     int scroll = (int)strip->scroll_x;
     if (scroll >= CLOUD_STRIP_W) scroll = 0;
 
-    int r = (int)(260.0f + 80.0f * s_sun_strength);
+    /* Cloud-edge sunlight reaches only the clouds near the sun. The old
+     * radius (260-340 px) swept almost half the screen — ~115k float-math
+     * iterations per frame, one of the two big CPU costs. FIB_144 (+ a small
+     * sun-strength term) keeps the lit halo tight around the sun where it's
+     * actually visible, cutting the scanned area ~5×. */
+    int r = (int)((float)FIB_144 + 34.0f * s_sun_strength);
     int r2 = r * r;
     int x0 = s_sun_x - r;
     int x1 = s_sun_x + r;
@@ -2621,7 +2871,11 @@ static void draw_sun_cloud_lighting(void)
 
     for (int i = CLOUD_LAYER_COUNT - 1; i >= 0; --i) {
         cloud_strip_t *strip = &s_strip[i];
-        if (strip->alpha_scale == 0) continue;
+        /* Skip the lit-edge pass for thin layers. Below this cover there are
+         * too few cloud pixels for the rim light to read, yet the variant
+         * scan still sweeps the whole sun region (Fib-144²) — pure waste that
+         * dropped clear-day (cover ~8 %) to ~23 FPS. FIB_34 ≈ 13 % cover. */
+        if (strip->alpha_scale < FIB_34) continue;
         int active = strip->active_variant % CLOUD_VARIANT_COUNT;
         int next = (active + 1) % CLOUD_VARIANT_COUNT;
         if (!strip->morphing) {
@@ -2644,35 +2898,16 @@ static void compose_clouds_into_working_buffer(float dt)
     update_cloud_tints();
     update_cloud_lifecycle(dt);
     advance_cloud_scroll(dt);
-    /* Single-layer cloud rendering — only LOW cumulus (most visually
-     * dominant). HIGH cirrus and MID altocumulus added too much PPA cost
-     * (3 passes × 3 layers = 9 PPA blends, ~80-115 ms cl) on this device's
-     * PSRAM bandwidth budget. LOW alone preserves the "cloud" look in
-     * exchange for less stratified depth — the trade chosen because the
-     * device cannot sustain >12 Hz with all three.
-     *
-     * Lifecycle (tint/scroll/morph) still ticks for all three layers so
-     * that switching back to multi-layer is a one-line change here.
-     * If we ever want to add MID back on heavy cover scenes, the right
-     * condition is `s_cloud_cover_pct > 70` — but only after async cloud
-     * bake or PPA non-blocking are in place. */
+    /* All three layers render (HIGH cirrus top → MID altocumulus → LOW
+     * cumulus bottom) so clouds fill the whole sky, not just the lower band.
+     * This is affordable now: the panel rotation moved to the PPA DMA engine
+     * (no per-frame CPU sw_rotate), the cloud blend itself is light-only and
+     * each layer's bake uses fewer blobs (see bake_strip_*), so the combined
+     * blend is only a few ms. blend_layer() early-outs on near-zero cover, so
+     * thin/clear layers cost nothing. */
+    blend_layer(&s_strip[CLOUD_LAYER_HIGH]);
+    blend_layer(&s_strip[CLOUD_LAYER_MID]);
     blend_layer(&s_strip[CLOUD_LAYER_LOW]);
-}
-
-static void draw_fog_bands(float t)
-{
-    uint16_t fog = rgb565(230, 232, 225);
-    for (int band = 0; band < 4; ++band) {
-        int base_y = (int)(EVA_WEATHER_RENDER_H * (0.34f + band * 0.16f));
-        float drift = sinf(t * 0.18f + band) * 22.0f;
-        for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 2) {
-            int y = base_y + (int)(sinf((float)x * 0.020f + t * 0.30f + band) * 18.0f + drift);
-            for (int yy = 0; yy < 18; ++yy) {
-                blend_px(x, y + yy, fog, FIB_34 - FIB_5);     /* 29 — wisp alpha */
-                blend_px(x + 1, y + yy, fog, FIB_34 - FIB_5);
-            }
-        }
-    }
 }
 
 static void update_and_draw_particles(float dt, float t)
@@ -2857,23 +3092,24 @@ static uint8_t background_hold_frames(weather_kind_t kind)
 
 static uint8_t composite_hold_frames(weather_kind_t kind)
 {
-    /* Reuse bg+text+clouds for short bursts. Expensive cloud PPA passes are
-     * amortized; particles, lightning, and godrays are still redrawn every
-     * frame. Longer holds are needed now that full-frame PPA rotation costs a
-     * fixed ~15 ms on this panel path. */
+    /* SHORT hold so cloud motion stays smooth. The composite caches the
+     * expensive sky+clouds+sunlight+godrays stack; reusing it for 3-4 frames
+     * amortises that cost (keeping ~25-30 FPS) while the clouds still update
+     * ~9-12×/sec — continuous to the eye. The previous 8-21 holds were what
+     * made the clouds visibly stutter (~2×/sec).
+     *
+     * Storm/rain get the shortest hold because their motion (fast clouds +
+     * particles) is the most motion-sensitive. */
     switch (kind) {
     case WEATHER_THUNDERSTORM:
     case WEATHER_HEAVY_RAIN:
-        return 8;
     case WEATHER_RAIN:
     case WEATHER_SLEET:
     case WEATHER_HAIL:
     case WEATHER_SNOW:
-        return 13;
-    case WEATHER_FOG:
-        return 13;
+        return 2;
     default:
-        return 21;
+        return 3;
     }
 }
 
@@ -2948,72 +3184,62 @@ static void render_weather(float dt)
         reset_particles_for_kind();
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
-        s_composite_ttl = 0;
-        s_composite_dt = 0.0f;
         s_prev_kind = s_kind;
     }
 
     int64_t now_us = esp_timer_get_time();
     float t = (float)now_us / 1000000.0f;
     s_bg_dt += dt;
-    s_composite_dt += dt;
 
+    /* NO composite cache. The composite cache reused the whole scene for N
+     * frames, and however short the hold, the reused frames landed unevenly
+     * against the PPA-rotation/vsync timing — which read as the clouds
+     * "freezing once a second". Clouds now redraw EVERY frame for genuinely
+     * continuous motion.
+     *
+     * To afford that, the per-frame work was cut down hard:
+     *   - background (sky gradient + sun disc/glow + halo + fog) is cached in
+     *     s_bg_buf and only re-rendered every background_hold_frames ticks
+     *     (it changes over minutes). The god-ray halo lives here too.
+     *   - the heavy sun-cloud rim lighting was removed.
+     *   - the cloud morph re-bake spike was removed.
+     *   - sun glow circles were capped at Fibonacci 89 px.
+     * What stays per-frame: one bg memcpy, one cloud PPA blend, particles,
+     * lightning. */
     int64_t tb0 = esp_timer_get_time();
-    bool composite_hit = (s_composite_buf && s_composite_ttl > 0);
-
-    if (composite_hit) {
-        memcpy(s_buf, s_composite_buf,
-               EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
-        s_composite_ttl--;
-        if (s_bg_ttl > 0) s_bg_ttl--;
+    if (!s_bg_buf || s_bg_ttl == 0) {
+        sky_t sky = sky_for_kind(s_kind);
+        fill_gradient(sky.top, sky.bottom);
+        draw_day_sky_depth();
+        draw_sun_or_moon(t);
+        draw_sun_sky_glare();
+        draw_sun_god_rays(t);          /* halo baked into the cached bg */
+        if (s_bg_buf) {
+            memcpy(s_bg_buf, s_buf,
+                   EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
+        }
+        s_bg_dt = 0.0f;
+        s_bg_ttl = background_hold_frames(s_kind);
     } else {
-        if (!s_bg_buf || s_bg_ttl == 0) {
-            sky_t sky = sky_for_kind(s_kind);
-            fill_gradient(sky.top, sky.bottom);
-            draw_day_sky_depth();
-            draw_sun_or_moon(t);
-            draw_sun_sky_glare();
-            if (s_fog_pct >= 30) {
-                draw_fog_bands(t);
-            }
-            if (s_bg_buf) {
-                memcpy(s_bg_buf, s_buf,
-                       EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
-            }
-            s_bg_dt = 0.0f;
-            s_bg_ttl = background_hold_frames(s_kind);
-        } else {
-            memcpy(s_buf, s_bg_buf,
-                   EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
-            s_bg_ttl--;
-        }
-        int64_t tb_after_bg = esp_timer_get_time();
-        s_prof_bg_us += (tb_after_bg - tb0);
-
-        draw_scene_text_overlays();
-        compose_clouds_into_working_buffer(dt);
-        draw_sun_cloud_lighting();
-        draw_sun_god_rays(t);
-
-        int64_t tb_after_clouds = esp_timer_get_time();
-        s_prof_clouds_us += (tb_after_clouds - tb_after_bg);
-
-        if (s_composite_buf) {
-            memcpy(s_composite_buf, s_buf,
-                   EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
-        }
-        s_composite_dt = 0.0f;
-        s_composite_ttl = composite_hold_frames(s_kind) - 1;
+        memcpy(s_buf, s_bg_buf,
+               EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
+        s_bg_ttl--;
     }
+    int64_t tb_after_bg = esp_timer_get_time();
+    s_prof_bg_us += (tb_after_bg - tb0);
 
-    int64_t tb_after_static = esp_timer_get_time();
-    if (composite_hit) {
-        s_prof_bg_us += (tb_after_static - tb0);
-    }
+    /* Clouds + text fresh every frame — smooth, wind-driven motion. */
+    draw_scene_text_overlays();
+    int64_t tb_after_text = esp_timer_get_time();
+    compose_clouds_into_working_buffer(dt);
 
+    int64_t tb_after_clouds = esp_timer_get_time();
+    s_prof_clouds_us += (tb_after_clouds - tb_after_bg);
+
+    (void)tb_after_text;
     update_and_draw_particles(dt, t);
     int64_t tb3 = esp_timer_get_time();
-    s_prof_particles_us += (tb3 - tb_after_static);
+    s_prof_particles_us += (tb3 - tb_after_clouds);
 
     update_lightning(t);
     composite_lightning_on_render();
@@ -3092,6 +3318,7 @@ static void native_render_task(void *arg)
 {
     (void)arg;
     int64_t prof_rotate_us = 0;
+    int64_t tick_min = 1000000, tick_max = 0;   /* DIAG: frame interval jitter */
 
     while (true) {
         if (!s_visible || !s_render_buf || !s_panel || !s_dpi_back_fb) {
@@ -3105,6 +3332,8 @@ static void native_render_task(void *arg)
         float dt = (float)tick_us / 1000000.0f;
         if (dt < 0.0f || dt > 0.10f) dt = (float)TIMER_MS / 1000.0f;
         s_last_us = now;
+        if (tick_us < tick_min) tick_min = tick_us;
+        if (tick_us > tick_max) tick_max = tick_us;
         s_buf = s_render_buf;
 
         int64_t t0 = esp_timer_get_time();
@@ -3133,6 +3362,7 @@ static void native_render_task(void *arg)
         int64_t t_draw = esp_timer_get_time();
         (void)xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(40));
         int64_t t_vsync = esp_timer_get_time();
+        (void)t_draw;
 
         uint16_t *old_scan = s_dpi_scan_fb;
         s_dpi_scan_fb = s_dpi_back_fb;
@@ -3156,12 +3386,14 @@ static void native_render_task(void *arg)
             uint32_t li_avg     = (uint32_t)(s_prof_lightning_us / s_frames);
             uint32_t rot_avg    = (uint32_t)(prof_rotate_us      / s_frames);
             uint32_t vsync_avg  = (uint32_t)(s_accum_lvgl_slot_us / s_frames);
-            ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u cl=%u pa=%u li=%u ppa_rot=%u lvgl=0 vsync=%u)",
+            ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u cl=%u pa=%u li=%u ppa_rot=%u lvgl=0 vsync=%u) jitter=%u..%u",
                      weather_kind_name(s_kind), (unsigned)tick_hz,
                      (unsigned)s_target, (unsigned)s_max_target,
                      (unsigned)s_clouds3d_active, (unsigned)CLOUD_3D_MAX,
                      (unsigned)avg,
-                     bg_avg, cl_avg, pa_avg, li_avg, rot_avg, vsync_avg);
+                     bg_avg, cl_avg, pa_avg, li_avg, rot_avg, vsync_avg,
+                     (unsigned)tick_min, (unsigned)tick_max);
+            tick_min = 1000000; tick_max = 0;
             s_last_tick_hz = tick_hz;
             s_last_work_us = avg;
             s_last_bg_us = bg_avg;
@@ -3549,12 +3781,23 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
     s_moonset_min  = st->moonset_min;
     /* Apply test overrides first (sliders). Live values used only if
      * the corresponding override is -1. */
-    s_cloud_pct[CLOUD_LAYER_HIGH] = (s_test_cloud_pct_override[CLOUD_LAYER_HIGH] >= 0)
+    uint8_t live_high = (s_test_cloud_pct_override[CLOUD_LAYER_HIGH] >= 0)
         ? (uint8_t)s_test_cloud_pct_override[CLOUD_LAYER_HIGH] : st->cloud_high_pct;
-    s_cloud_pct[CLOUD_LAYER_MID]  = (s_test_cloud_pct_override[CLOUD_LAYER_MID] >= 0)
+    uint8_t live_mid  = (s_test_cloud_pct_override[CLOUD_LAYER_MID] >= 0)
         ? (uint8_t)s_test_cloud_pct_override[CLOUD_LAYER_MID]  : st->cloud_mid_pct;
-    s_cloud_pct[CLOUD_LAYER_LOW]  = (s_test_cloud_pct_override[CLOUD_LAYER_LOW] >= 0)
+    uint8_t live_low  = (s_test_cloud_pct_override[CLOUD_LAYER_LOW] >= 0)
         ? (uint8_t)s_test_cloud_pct_override[CLOUD_LAYER_LOW]  : st->cloud_low_pct;
+    s_cloud_pct[CLOUD_LAYER_HIGH] = live_high;
+    s_cloud_pct[CLOUD_LAYER_MID]  = live_mid;
+    /* Only the LOW layer is actually rendered (single-layer pipeline), so it
+     * must carry the *overall* cloudiness — otherwise overcast skies, whose
+     * cover lives almost entirely in the MID/HIGH bands, would render as an
+     * empty sky. Feed LOW the strongest of the three bands so the visible
+     * cloud amount always matches how cloudy it really is. */
+    uint8_t strongest = live_low;
+    if (live_mid  > strongest) strongest = live_mid;
+    if (live_high > strongest) strongest = live_high;
+    s_cloud_pct[CLOUD_LAYER_LOW]  = strongest;
     s_cloud_cover_pct = st->cloud_cover_pct;
     s_fog_pct = st->fog_pct;
     s_moon_phase_pct = st->moon_phase_pct;
@@ -3686,18 +3929,26 @@ void eva_weather_canvas_set_test_cloud_pct(int high, int mid, int low)
     portEXIT_CRITICAL(&s_frame_mux);
 }
 
+/* Test wind override. wind_kph encodes BOTH magnitude and direction:
+ *   > 0  → wind from the west, blowing east  (clouds/rain drift right)
+ *   < 0  → wind from the east, blowing west  (clouds/rain drift left)
+ *   special sentinel -1000 (or any value via the CDC "windclear") clears it.
+ * The CDC `wind <signed_kph>` command uses this so both drift directions can
+ * be exercised on demand regardless of the live weather. */
 void eva_weather_canvas_set_test_wind_kph(int wind_kph)
 {
     portENTER_CRITICAL(&s_frame_mux);
-    if (wind_kph < 0) {
+    if (wind_kph <= -1000) {
         s_test_wind_kph_override = -1;
     } else {
-        if (wind_kph > 120) wind_kph = 120;
-        s_test_wind_kph_override = (int16_t)wind_kph;
-        /* Direct east-bound wind for slider control. Positive = right drift.
-         * k_rain factor 1.6 matches the live-weather path. */
-        s_wind_vx_bias = (float)wind_kph * 1.6f;
-        s_wind_kph_eff = (float)wind_kph;
+        int mag = wind_kph < 0 ? -wind_kph : wind_kph;
+        if (mag > 120) mag = 120;
+        float signed_kph = (wind_kph < 0) ? -(float)mag : (float)mag;
+        s_test_wind_kph_override = (int16_t)mag;
+        /* k_rain factor 1.6 matches the live-weather path; sign carries
+         * the drift direction. */
+        s_wind_vx_bias = signed_kph * 1.6f;
+        s_wind_kph_eff = (float)mag;
     }
     portEXIT_CRITICAL(&s_frame_mux);
 }

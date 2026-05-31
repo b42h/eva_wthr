@@ -141,19 +141,7 @@ static esp_err_t parse_openmeteo_json(const char *json, weather_partial_t *out)
         return ESP_FAIL;
     }
 
-    /* --- weather_code + kind --- */
-    cJSON *jcode  = cJSON_GetObjectItem(cur, "weather_code");
-    cJSON *jisday = cJSON_GetObjectItem(cur, "is_day");
-    int code = cJSON_IsNumber(jcode) ? jcode->valueint : -1;
-    int is_day = cJSON_IsNumber(jisday) ? jisday->valueint : 1;
-    out->weather_code = code;
-    weather_kind_t kind;
-    if (code >= 0 && wmo_to_kind(code, is_day, &kind)) {
-        out->has_kind = true;
-        out->kind = kind;
-    }
-
-    /* --- clouds --- */
+    /* --- clouds (parsed before kind so kind can use real cover) --- */
     cJSON *jcc  = cJSON_GetObjectItem(cur, "cloud_cover");
     cJSON *jccl = cJSON_GetObjectItem(cur, "cloud_cover_low");
     cJSON *jccm = cJSON_GetObjectItem(cur, "cloud_cover_mid");
@@ -164,6 +152,26 @@ static esp_err_t parse_openmeteo_json(const char *json, weather_partial_t *out)
         out->cloud_low_pct  = cJSON_IsNumber(jccl) ? (uint8_t)jccl->valuedouble : 0;
         out->cloud_mid_pct  = cJSON_IsNumber(jccm) ? (uint8_t)jccm->valuedouble : 0;
         out->cloud_high_pct = cJSON_IsNumber(jcch) ? (uint8_t)jcch->valuedouble : 0;
+    }
+
+    /* --- weather_code + kind --- */
+    cJSON *jcode  = cJSON_GetObjectItem(cur, "weather_code");
+    cJSON *jisday = cJSON_GetObjectItem(cur, "is_day");
+    int code = cJSON_IsNumber(jcode) ? jcode->valueint : -1;
+    int is_day = cJSON_IsNumber(jisday) ? jisday->valueint : 1;
+    out->weather_code = code;
+    weather_kind_t kind;
+    if (code >= 0 && wmo_to_kind(code, is_day, &kind)) {
+        /* WMO 3 ("overcast") is reported by Open-Meteo well before the sky is
+         * actually solid. Only treat it as true overcast when cover is high;
+         * otherwise keep a partly cloudy scene so sun/moon remains visible. */
+        if (kind == WEATHER_CLOUDY && out->has_clouds &&
+            out->cloud_cover_pct < 88) {
+            kind = is_day ? WEATHER_PARTLY_CLOUDY_DAY
+                          : WEATHER_PARTLY_CLOUDY_NIGHT;
+        }
+        out->has_kind = true;
+        out->kind = kind;
     }
 
     /* --- temp --- */

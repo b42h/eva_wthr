@@ -2087,6 +2087,23 @@ static void cdc_handle_command(void *user, char *line)
         return;
     }
 
+    /* Force a test wind so both drift directions can be checked on demand.
+     *   wind <signed_kph>  e.g. "wind 40" (east, →) or "wind -40" (west, ←)
+     *   wind clear         release the override, back to live wind */
+    if (strncmp(cmd, "wind", 4) == 0 && isspace((unsigned char)cmd[4])) {
+        char *value = trim_in_place(cmd + 4);
+        if (strcmp(value, "clear") == 0) {
+            eva_weather_canvas_set_test_wind_kph(-1000);
+            cdc_send("OK wind cleared (live)\r\n");
+        } else {
+            int kph = atoi(value);
+            eva_weather_canvas_set_test_wind_kph(kph);
+            cdc_sendf("OK wind %+d kph (%s)\r\n", kph,
+                      kph > 0 ? "east/right" : kph < 0 ? "west/left" : "calm");
+        }
+        return;
+    }
+
     if (strcmp(cmd, "log") == 0) {
         cdc_sendf("log_level: %s\r\n", log_level_to_str(esp_log_level_get("*")));
         return;
