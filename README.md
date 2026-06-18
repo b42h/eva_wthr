@@ -20,6 +20,16 @@ This repository folder is named `eva_wthr`, but the original project name was `E
 
 It does not include the older "eyes" scene. This repository is the weather firmware only.
 
+## Screenshots
+
+Captured on the real `JC4880P443C_I_W` board at native 800×480 (CDC `screenshot` command).
+
+| Clear day | Rain (outdoor + glass droplets) | Partly cloudy |
+| --- | --- | --- |
+| ![Clear day scene](docs/images/clear-day.jpg) | ![Rain scene](docs/images/rain-day.jpg) | ![Partly cloudy scene](docs/images/partly-cloudy-day.jpg) |
+
+The scene is fully procedural: sky gradient, sun/moon arc, layered 3D clouds, precipitation, and a glass overlay with animated droplets. Text (clock, date, temp, description) is rendered from baked A8 masks and composited under the cloud layers.
+
 ## Hardware
 
 Tested on:
