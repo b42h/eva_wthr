@@ -22,13 +22,14 @@ It does not include the older "eyes" scene. This repository is the weather firmw
 
 ## Screenshots
 
-Captured on the real `JC4880P443C_I_W` board at native 800×480 (CDC `screenshot` command).
+Fresh captures from the current firmware on real hardware (800×480, CDC `screenshot`).
 
-| Clear day | Rain (outdoor + glass droplets) | Partly cloudy |
+| Partly cloudy | Clear day | Rain |
 | --- | --- | --- |
-| ![Clear day scene](docs/images/clear-day.jpg) | ![Rain scene](docs/images/rain-day.jpg) | ![Partly cloudy scene](docs/images/partly-cloudy-day.jpg) |
+| ![Partly cloudy day](docs/images/partly-cloudy-day.jpg) | ![Clear day](docs/images/clear-day.jpg) | ![Rain day](docs/images/rain-day.jpg) |
+| Layered clouds, sun, 288px clock | 2× Fibonacci sun + animated halo | Outdoor rain + glass droplets |
 
-The scene is fully procedural: sky gradient, sun/moon arc, layered 3D clouds, precipitation, and a glass overlay with animated droplets. Text (clock, date, temp, description) is rendered from baked A8 masks and composited under the cloud layers.
+The scene is fully procedural: sky gradient, sun/moon arc, 3D cloud strips, precipitation, and a top glass overlay. Text is baked from A8 masks and drawn under the cloud layers.
 
 ## Hardware
 
