@@ -1,16 +1,76 @@
 # eva_wthr
 
-Weather-only firmware for the Guition `JC4880P443C_I_W` / `ESP32-P4 + ESP32-C6` board.
+Weather-only firmware for the Guition `JC4880P443C_I_W` board (ESP32-P4 main MCU + ESP32-C6 hosted Wi-Fi).
 
-This is the final working `phase8_finished` build, separated into its own repository folder for people who are specifically looking for firmware for this P4+C6 display board.
+On boot it goes straight into a **native 800×480 procedural weather scene** — no menu, no legacy “eyes” demo. The clock, temperature, date, and description come from live weather fetches; everything else (sky, clouds, sun, rain, glass) is drawn in real time on the CPU/PPA pipeline.
 
-## Naming Note
+## How It Looks Now
 
-This repository folder is named `eva_wthr`, but the original project name was `Eva`. That is why the firmware, binary, source files, logs, and commands still use names like `eva_weather`, `eva_*`, and `Eva WEATHER`. They are left as-is because this is the tested working naming from the final firmware.
+Think of it as looking through a window at the weather outside.
+
+**Centre stack**
+- **288 px extralight clock** (Manrope-based `eva_font_clock_288_extralight`) — always horizontally centred
+- **Date + temperature** in the upper band (centred, or shifted sideways if the sun halo would overlap)
+- **Weather description** in the lower band (Ukrainian-capable `eva_font_uk_22`)
+
+**Sky & sun**
+- Vertical gradient sky with daypart palettes (morning / day / evening / night)
+- Sun or moon follows a day arc: low at sunrise/sunset, high near solar noon
+- Sun disc and glow use **Fibonacci radii** (42 px disc, rings at 55 / 89 / 144 px)
+- A **per-frame animated halo** breathes on outer rings (89 / 144 / 233 px) with eight slow soft rays
+
+**Clouds**
+- Three scrolling layers (high cirrus → mid cumulus → low base), hardware-blended via PPA
+- Clouds composite **over** the text so thin edges can partially cover the clock — reads as depth, not a HUD pasted on top
+
+**Precipitation & storms**
+- Outdoor rain, snow, sleet, hail, and fog particles sit **behind the window**
+- Thunderstorms add a full-screen flash plus a jagged bolt
+
+**Glass overlay (top layer)**
+- During rain: droplets **form**, start slow, accelerate with drag, leave a short wet trail, then dry
+- Outdoor streaks stay outside; glass beads and soft specular sparkles sit on the pane in front of everything
+
+### Render order (bottom → top)
+
+```text
+cached sky + sun/moon disc
+  → animated sun halo (every frame)
+  → outdoor rain / snow / lightning
+  → text (clock, date, temp, description)
+  → clouds (HIGH → MID → LOW)
+  → glass (droplets + glints)
+```
+
+## Screenshots
+
+Captured on real hardware after flashing the current `main` branch (`CDC screenshot`, 800×480).
+
+| Partly cloudy | Clear day | Rain |
+| --- | --- | --- |
+| ![Partly cloudy day](docs/images/partly-cloudy-day.jpg) | ![Clear day](docs/images/clear-day.jpg) | ![Rain day](docs/images/rain-day.jpg) |
+| Layered clouds, warm sun behind the clock, date/temp above | Larger Fibonacci sun with pulsing halo rings | Outdoor streaks behind the pane; beads and trails on the glass |
+
+## What's New Since the First GitHub Release
+
+The first public commit (`65c2e5f`) already had the working P4+C6 weather stack. The current build (`b0bebe4` and later) is a major visual and compositing refresh:
+
+| Area | First release | Current |
+| --- | --- | --- |
+| Clock | 144 px extralight | **288 px** extralight (`eva_font_clock_288_extralight.c`) |
+| Sun | ~21 px disc, static 89 px halo | **42 px disc**, glow 55→89→144 px, **animated** outer halo every frame |
+| Text vs clouds | Text on top of clouds | Text **under** clouds (PPA blend occludes it naturally) |
+| Rain | Single outdoor particle layer | Outdoor rain **+** glass droplets with forming / slide / trail / dry physics |
+| Sun vs top text | Always centred | Date/temp **shift away** from the sun when the halo overlaps the top band |
+| Glass glints | — | Soft fixed sparkles on the pane (no rotating lens-flare beam) |
+| Layer order | Simpler stack | Explicit z-order: sky → halo → outdoor FX → text → clouds → glass |
+| Moon | Smaller disc | **2×** radius to match the larger sun |
+
+Removed for stability/FPS: full-screen sky glare scan and heavy static god-ray passes (they caused visible hitches on clear days).
 
 ## What This Firmware Does
 
-- Boots directly into an animated 800x480 procedural weather scene.
+- Boots directly into the animated 800×480 scene described above.
 - Uses the ESP32-C6 as hosted Wi-Fi through `esp_hosted`.
 - Fetches weather from Open-Meteo and Clear Outside.
 - Syncs time over HTTP Date headers instead of SNTP, because SNTP was unstable on this hosted Wi-Fi stack.
@@ -20,16 +80,9 @@ This repository folder is named `eva_wthr`, but the original project name was `E
 
 It does not include the older "eyes" scene. This repository is the weather firmware only.
 
-## Screenshots
+## Naming Note
 
-Fresh captures from the current firmware on real hardware (800×480, CDC `screenshot`).
-
-| Partly cloudy | Clear day | Rain |
-| --- | --- | --- |
-| ![Partly cloudy day](docs/images/partly-cloudy-day.jpg) | ![Clear day](docs/images/clear-day.jpg) | ![Rain day](docs/images/rain-day.jpg) |
-| Layered clouds, sun, 288px clock | 2× Fibonacci sun + animated halo | Outdoor rain + glass droplets |
-
-The scene is fully procedural: sky gradient, sun/moon arc, 3D cloud strips, precipitation, and a top glass overlay. Text is baked from A8 masks and drawn under the cloud layers.
+This repository folder is named `eva_wthr`, but the original project name was **Eva**. Firmware, binary, logs, and CDC commands still use `eva_weather`, `eva_*`, and `Eva WEATHER` — left unchanged because that is what the board expects.
 
 ## Hardware
 
@@ -250,7 +303,8 @@ wind clear
 | Path | Purpose |
 | --- | --- |
 | `main/main.c` | App entry, CDC command handling, test panel. |
-| `main/eva_weather_canvas.c` | Procedural weather renderer. |
+| `main/eva_weather_canvas.c` | Procedural renderer: sky, clouds, sun, particles, text, glass. |
+| `main/eva_font_clock_288_extralight.c` | 288 px clock font (Manrope ExtraLight). |
 | `main/eva_wifi.c` | Hosted Wi-Fi setup and HTTP time sync. |
 | `main/weather_fetch.c` | Dual-source weather coordinator. |
 | `main/weather_fetch_openmeteo.c` | Open-Meteo API provider. |
