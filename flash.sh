@@ -11,13 +11,8 @@ PORT="${1:-}"
 
 if [ -z "${IDF_PATH:-}" ]; then
   export IDF_PATH="$HOME/.espressif/v5.5.4/esp-idf"
-fi
-
-if ! command -v esptool.py >/dev/null 2>&1 && [ -f "$IDF_PATH/export.sh" ]; then
-  # Load ESP-IDF tools when the caller did not already source export.sh.
-  # Keep output quiet so the flash log stays readable.
   # shellcheck disable=SC1091
-  . "$IDF_PATH/export.sh" >/dev/null 2>&1 || true
+  source "$IDF_PATH/export.sh"
 fi
 
 if [ -z "$PORT" ]; then

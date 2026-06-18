@@ -9,7 +9,6 @@
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
-#include "sdkconfig.h"
 
 #include "eva_weather.h"
 
@@ -30,7 +29,7 @@
  * We always read the first <li> (h0) which corresponds to the current hour
  * because the page auto-centres on the request time. */
 
-#define WEATHER_URL "http://clearoutside.com/forecast/" CONFIG_EVA_WEATHER_LATITUDE "/" CONFIG_EVA_WEATHER_LONGITUDE
+#define WEATHER_URL "http://clearoutside.com/forecast/48.91/24.71"
 #define WEATHER_REFRESH_MS (13 * 60 * 1000)
 #define WEATHER_RETRY_MS   (60 * 1000)
 #define WEATHER_FIRST_FETCH_DELAY_MS (15 * 1000)

@@ -2158,7 +2158,8 @@ void app_main(void)
     ESP_ERROR_CHECK(bsp_display_new_with_handles(NULL, &lcd_handles));
     ESP_ERROR_CHECK(lcd_handles.panel ? ESP_OK : ESP_FAIL);
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(lcd_handles.panel, true));
-    ESP_ERROR_CHECK(bsp_display_backlight_on());
+    ESP_ERROR_CHECK(bsp_display_brightness_init());   /* enable LEDC PWM backlight control */
+    ESP_ERROR_CHECK(bsp_display_backlight_on());       /* 100% after PWM init */
     weather_screen_init_native(lcd_handles.panel);
 
     /* Clock runs as a FreeRTOS task (replaces the LVGL timer path that the

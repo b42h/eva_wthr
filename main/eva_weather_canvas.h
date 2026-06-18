@@ -21,6 +21,7 @@ void eva_weather_canvas_set_weather(const weather_state_t *st);
 void eva_weather_canvas_show(bool show);
 void eva_weather_canvas_set_time_offset(int hours);
 void eva_weather_canvas_set_clock_text(const char *text);
+void eva_weather_canvas_set_date_text(const char *text);
 void eva_weather_canvas_set_temp_text(const char *text);
 void eva_weather_canvas_set_desc_text(const char *text);
 

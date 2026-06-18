@@ -1,7 +1,8 @@
 /* main/weather_fetch_openmeteo.c
  *
  * Fetches current weather from api.open-meteo.com and parses the JSON
- * into weather_partial_t. Coordinates come from project config.
+ * into weather_partial_t. Coordinates: 48.915155 N, 24.710636 E
+ * (hardcoded, same as clearoutside scraper).
  */
 #include "weather_fetch_openmeteo.h"
 
@@ -12,7 +13,6 @@
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
 #include "eva_weather.h"
-#include "sdkconfig.h"
 
 static const char *TAG = "wx_openmeteo";
 
@@ -22,8 +22,7 @@ static const char *TAG = "wx_openmeteo";
  * `sunshine_duration` is in seconds per current day. */
 #define OPENMETEO_URL \
     "https://api.open-meteo.com/v1/forecast" \
-    "?latitude=" CONFIG_EVA_WEATHER_LATITUDE \
-    "&longitude=" CONFIG_EVA_WEATHER_LONGITUDE \
+    "?latitude=48.915155&longitude=24.710636" \
     "&current=temperature_2m,apparent_temperature," \
               "precipitation,weather_code,cloud_cover," \
               "cloud_cover_low,cloud_cover_mid,cloud_cover_high," \
@@ -96,7 +95,7 @@ static bool wmo_to_kind(int code, int is_day, weather_kind_t *kind_out)
             *kind_out = WEATHER_THUNDERSTORM;
             return true;
         case 96: case 99:            /* thunderstorm with hail */
-            *kind_out = WEATHER_HAIL;
+            *kind_out = WEATHER_THUNDERSTORM;
             return true;
         default:
             return false;
@@ -163,8 +162,11 @@ static esp_err_t parse_openmeteo_json(const char *json, weather_partial_t *out)
     weather_kind_t kind;
     if (code >= 0 && wmo_to_kind(code, is_day, &kind)) {
         /* WMO 3 ("overcast") is reported by Open-Meteo well before the sky is
-         * actually solid. Only treat it as true overcast when cover is high;
-         * otherwise keep a partly cloudy scene so sun/moon remains visible. */
+         * actually solid — often at 60-80 % cover where the sun still breaks
+         * through. A flat grey "cloudy" scene with no sun looks wrong there.
+         * Only treat it as true overcast when cover is high (≥ 88 %);
+         * otherwise downgrade to partly-cloudy so the sun stays visible and
+         * the sky keeps its blue. */
         if (kind == WEATHER_CLOUDY && out->has_clouds &&
             out->cloud_cover_pct < 88) {
             kind = is_day ? WEATHER_PARTLY_CLOUDY_DAY

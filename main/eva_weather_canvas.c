@@ -16,7 +16,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/ppa.h"
-#include "sdkconfig.h"
 
 /* --- Fibonacci timing core ------------------------------------------------
  * Every cadence in Eva is expressed in Fibonacci numbers so animations share
@@ -48,6 +47,8 @@
  * a separate upscale pass (~8 ms on the previous 400×240→800×480 SRM). */
 #define EVA_WEATHER_RENDER_W 800
 #define EVA_WEATHER_RENDER_H 480
+#define PPA_CACHE_ALIGN 128   /* ESP32-P4 L2 cache line; required for PPA DMA */
+#define EVA_FRAME_BYTES (EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t))
 #define EVA_PHI 1.6180339f
 #define EVA_PHI2 (EVA_PHI * EVA_PHI)
 #define EVA_INV_PHI 0.61803399f
@@ -63,6 +64,54 @@
 #define CLOUD_LAYER_LOW  2
 #define CLOUD_LAYER_COUNT 3
 #define CLOUD_VARIANT_COUNT 2
+
+#define GLASS_GLINT_MAX  FIB_8
+#define GLASS_DROP_MAX   FIB_34
+
+typedef struct {
+    float x;
+    float y;
+    float len;
+    float phase;
+    float strength;
+} glass_glint_t;
+
+typedef enum {
+    GLASS_DROP_FORMING = 0,
+    GLASS_DROP_SLIDING,
+    GLASS_DROP_DRYING,
+} glass_drop_state_t;
+
+typedef struct {
+    float x;
+    float y;
+    float vx;
+    float vy;
+    float r;
+    float target_r;
+    float v_term;
+    float phase;
+    float alpha;
+    float alpha_peak;
+    glass_drop_state_t state;
+    float timer;        /* forming hold or dry fade remaining (s) */
+    float form_total;   /* forming duration at spawn (s) */
+    float fade_total;   /* dry fade duration at start */
+    float slide_quota;  /* px this bead may travel before stopping */
+    float dist_slid;
+    bool will_slide;
+} glass_drop_t;
+
+/* px/s² — gravity along the glass plane (much weaker effective fall than outdoors). */
+#define GLASS_SLIDE_GRAVITY  140.0f
+/* Terminal slide speed from bead radius: ~23–67 px/s for r≈1–5. */
+#define GLASS_VTERM_BASE     12.0f
+#define GLASS_VTERM_PER_R    11.0f
+
+static glass_glint_t s_glass_glints[GLASS_GLINT_MAX];
+static glass_drop_t s_glass_drops[GLASS_DROP_MAX];
+static bool s_glass_glints_inited;
+static bool s_glass_drops_inited;
 
 typedef enum {
     P_NONE = 0,
@@ -155,20 +204,21 @@ typedef struct {
 } cloud_strip_t;
 
 static const char *TAG = "eva_canvas";
-LV_FONT_DECLARE(eva_font_clock_144_extralight);
+LV_FONT_DECLARE(eva_font_clock_288_extralight);
 LV_FONT_DECLARE(eva_font_uk_22);
 
 static lv_obj_t *s_canvas;
 static lv_timer_t *s_timer;
 static uint16_t *s_buf;
 static uint16_t *s_bg_buf;
-static uint16_t *s_composite_buf;
+static bool s_blend_from_sky;
 static uint16_t *s_display_buf;
 static uint16_t *s_render_buf;
 static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_dpi_fb[2];
 static uint16_t *s_dpi_scan_fb;
 static uint16_t *s_dpi_back_fb;
+static SemaphoreHandle_t s_render_lock;
 static SemaphoreHandle_t s_ppa_done_sem;
 static SemaphoreHandle_t s_vsync_sem;
 static TaskHandle_t s_render_task;
@@ -184,7 +234,9 @@ static volatile int s_time_offset_hours;
 /* Forward declaration — needed by draw_scene_text_overlays() above the
  * actual definition further down. */
 static bool is_night_kind(weather_kind_t kind);
+static bool weather_kind_has_precip_particles(weather_kind_t kind);
 static float s_density_scale = 1.0f;
+static precip_type_t s_precip_type = PRECIP_NONE;
 static particle_t s_particles[PARTICLE_MAX];
 static cloud_strip_t s_strip[CLOUD_LAYER_COUNT] = {
     /* Calm-air base drift speeds in px/s — chosen from the Fibonacci ladder so
@@ -215,8 +267,7 @@ static cloud_strip_t s_strip[CLOUD_LAYER_COUNT] = {
     },
 };
 /* Sun position cache — populated by draw_sun_or_moon() in the bg-cache pass,
- * read by draw_sun_god_rays() after the cloud composite. Lets sunlight bleed
- * THROUGH the cloud cover instead of being permanently shadowed by it. */
+ * read by glass glints and cloud tinting. */
 static int s_sun_x = -1;
 static int s_sun_y = -1;
 static int s_sun_r = 0;
@@ -246,8 +297,6 @@ static int16_t s_lightning_x[6];
 static int16_t s_lightning_y[6];
 static uint8_t s_bg_ttl;
 static float s_bg_dt;
-static uint8_t s_composite_ttl;
-static float s_composite_dt;
 static bool s_visible;
 /* Sun event minutes-of-day from clearoutside astronomy. -1 = unknown -> fall back to
  * hardcoded 6:00 / 18:00 used in the original time-of-day spec. The window
@@ -279,50 +328,57 @@ static float s_wind_vx_bias = 0.0f;   /* px/s, signed */
 static float s_wind_kph_eff = 0.0f;   /* magnitude for snow wobble amplitude */
 #define SUN_WINDOW_MIN FIB_55   /* sunrise/sunset transition window, ~55 min. */
 static int64_t s_prof_bg_us;
+static int64_t s_prof_text_us;
 static int64_t s_prof_clouds_us;
 static int64_t s_prof_particles_us;
 static int64_t s_prof_lightning_us;
+static int64_t s_prof_glass_us;
+static int64_t s_prof_glass_us;
 static char s_clock_text[16] = "00:00";
+static char s_date_text[24] = "";
 static char s_temp_text[16] = "+0C";
 static char s_desc_text[96] = "";
 static portMUX_TYPE s_text_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* Pre-baked A8 text overlays.
- *
- * The three on-canvas labels (clock, temp, desc) change at most once per
- * minute, but draw_scene_text_overlays() was running the full per-glyph
- * decode + scaled blit on EVERY frame (17-60 Hz). Each clock frame walked
- * 5 glyphs × ~7000 dst pixels with nearest-neighbour scaling — pure waste
- * since the result was identical for ~1000 consecutive frames.
- *
- * Cache strategy:
- *   - One A8 mask per slot, sized to the worst-case rendered footprint.
- *   - bake_text_slot() rebuilds the mask only when the input text or scale
- *     changes (cache key = text + scale_q8). The bake reuses the existing
- *     per-glyph decoder but writes into the slot's A8 buffer instead of the
- *     RGB565 render buffer, so there's no colour/alpha at bake time.
- *   - blit_text_slot() composites the cached A8 onto s_buf with the
- *     requested colour+alpha. This is a single linear pass over the slot's
- *     footprint, no glyph decoding.
- *
- * Storage: 86 KB per slot worst case (720×120 A8) × 3 slots = ~260 KB PSRAM.
- * Cheap vs the gain (≈10 ms/frame off render_weather hot path). */
-#define TEXT_SLOT_BUF_W   720
-#define TEXT_SLOT_BUF_H   120
+/* Pre-baked A8 scene text: max-size clock in the centre band; date/temp
+ * above and desc below in the remaining vertical space. One full-frame mask
+ * is baked when any line changes, then blitted once per frame. */
+#define TEXT_SLOT_BUF_W   EVA_WEATHER_RENDER_W
+#define TEXT_SLOT_BUF_H   EVA_WEATHER_RENDER_H
 #define TEXT_SLOT_BUF_BYTES (TEXT_SLOT_BUF_W * TEXT_SLOT_BUF_H)
+#define SCENE_MARGIN        24   /* same gap: screen edge ↔ text ↔ clock ↔ text ↔ edge */
+#define SCENE_INFO_LINE_GAP  6   /* gap between date and temp within top block */
+#define SCENE_CLOCK_SCALE_Q8 256 /* native eva_font_clock_288_extralight (2× former 144px) */
+#define SCENE_EVENING_MIN   105   /* minutes before sunset → evening palette/clock */
+
+typedef enum {
+    SCENE_DAYPART_NIGHT = 0,
+    SCENE_DAYPART_MORNING,
+    SCENE_DAYPART_DAY,
+    SCENE_DAYPART_EVENING,
+} scene_daypart_t;
 
 typedef struct {
-    uint8_t *a8;            /* allocated in PSRAM, TEXT_SLOT_BUF_BYTES */
-    uint16_t mask_w;        /* tight bounding width  (≤ TEXT_SLOT_BUF_W) */
-    uint16_t mask_h;        /* tight bounding height (≤ TEXT_SLOT_BUF_H) */
-    char key_text[96];      /* last baked text */
-    uint16_t key_scale_q8;  /* last baked scale */
+    uint8_t *a8;
+    uint16_t mask_w;
+    uint16_t mask_h;
+    uint16_t bbox_x0;
+    uint16_t bbox_y0;
+    uint16_t bbox_x1;
+    uint16_t bbox_y1;
+    char key_clock[16];
+    char key_date[24];
+    char key_temp[16];
+    char key_desc[96];
+    uint16_t key_clock_scale_q8;
+    uint8_t key_daypart;
     bool valid;
-} text_slot_t;
+    bool bbox_valid;
+} scene_text_slot_t;
 
-static text_slot_t s_clock_slot;
-static text_slot_t s_temp_slot;
-static text_slot_t s_desc_slot;
+static scene_text_slot_t s_scene_slot;
+
+static scene_daypart_t scene_daypart_now(void);
 
 /* Static glyph draw buffer for draw_text_utf8.
  *
@@ -331,11 +387,11 @@ static text_slot_t s_desc_slot;
  * LVGL labels normally work because LVGL's label widget allocates a draw_buf
  * via the draw layer; our render task lives outside LVGL and must supply one.
  *
- * Size: largest expected glyph is eva_font_clock_144_extralight (~102×102 A8
- * ≈ 10.4 KB). 160×160 = 25600 bytes gives comfortable headroom for any
- * accented Cyrillic glyphs and montserrat_48 (~48×48). */
-#define GLYPH_BUF_W      160
-#define GLYPH_BUF_H      160
+ * Size: largest expected glyph is eva_font_clock_288_extralight (~139×217 A8
+ * ≈ 30 KB). 256×256 = 65536 bytes gives headroom for clock digits and
+ * eva_font_uk_22 accented Cyrillic glyphs. */
+#define GLYPH_BUF_W      256
+#define GLYPH_BUF_H      256
 #define GLYPH_BUF_BYTES  (GLYPH_BUF_W * GLYPH_BUF_H)  /* A8 = 1 byte/px */
 static uint8_t  s_glyph_raw[GLYPH_BUF_BYTES] WORD_ALIGNED_ATTR;
 static lv_draw_buf_t s_glyph_draw_buf;
@@ -403,7 +459,7 @@ static uint16_t rgb565_from(rgb_t c)
 static uint16_t blend565(uint16_t dst, uint16_t src, uint8_t alpha)
 {
     if (alpha == 0) return dst;
-    if (alpha == 255) return src;
+    if (alpha >= 240) return src;
 
     int sr = (src >> 11) & 0x1f;
     int sg = (src >> 5) & 0x3f;
@@ -495,6 +551,10 @@ static void blend_px(int x, int y, uint16_t color, uint8_t alpha)
         return;
     }
     uint16_t *p = &s_buf[y * EVA_WEATHER_RENDER_W + x];
+    if (alpha >= 240) {
+        *p = color;
+        return;
+    }
     *p = blend565(*p, color, alpha);
 }
 
@@ -604,6 +664,55 @@ static int text_height_utf8_scaled(const lv_font_t *font, uint16_t scale_q8)
 {
     if (!font) return 0;
     return (int)(((int32_t)font->line_height * (int32_t)scale_q8 + 128) >> 8);
+}
+
+/* Horizontal centre in the full canvas (SCENE_MARGIN is already baked into the
+ * symmetric formula via inner_w). */
+static int scene_center_x(int line_w)
+{
+    return (TEXT_SLOT_BUF_W - line_w) / 2;
+}
+
+/* Sun halo overlaps the top info band (date/temp) when the luminary sits in the
+ * upper sky — shift that block sideways so margins look balanced. Clock stays
+ * centred; only the small info lines move. */
+static int scene_top_info_x_shift(int band_y, int band_h, int band_w)
+{
+    if (!s_sun_visible || s_sun_x < 0 || s_sun_y < 0 || band_w <= 0 || band_h <= 0) {
+        return 0;
+    }
+
+    const int halo_r = FIB_144;
+    int sun_l = s_sun_x - halo_r;
+    int sun_r = s_sun_x + halo_r;
+    int sun_t = s_sun_y - halo_r;
+    int sun_b = s_sun_y + halo_r;
+    int tx_l = scene_center_x(band_w);
+    int tx_r = tx_l + band_w;
+    int ty_t = band_y;
+    int ty_b = band_y + band_h;
+
+    if (sun_b < ty_t || sun_t > ty_b || sun_r <= tx_l || sun_l >= tx_r) {
+        return 0;
+    }
+
+    int shift = 0;
+    if (s_sun_x <= TEXT_SLOT_BUF_W / 2) {
+        shift = sun_r + SCENE_MARGIN - tx_l;
+    } else {
+        shift = -(tx_r - (sun_l - SCENE_MARGIN));
+    }
+    if (shift == 0) return 0;
+
+    int nx_l = tx_l + shift;
+    if (nx_l < SCENE_MARGIN) {
+        shift += SCENE_MARGIN - nx_l;
+    }
+    int nx_r = tx_l + shift + band_w;
+    if (nx_r > TEXT_SLOT_BUF_W - SCENE_MARGIN) {
+        shift -= nx_r - (TEXT_SLOT_BUF_W - SCENE_MARGIN);
+    }
+    return shift;
 }
 
 static void draw_text_utf8_scaled(const lv_font_t *font, const char *text,
@@ -735,39 +844,20 @@ static void draw_text_utf8(const lv_font_t *font, const char *text,
     }
 }
 
-/* Bake `text` at `scale_q8` into slot->a8 as a tight A8 mask. Writes a
- * mask_w × mask_h footprint starting at the top-left of slot->a8. Mask
- * pixels accumulate alpha; an existing mask is overwritten (memset 0 first).
- * No-op if (text,scale_q8) already matches slot's cached key. */
-static void bake_text_slot(text_slot_t *slot, const lv_font_t *font,
-                           const char *text, uint16_t scale_q8)
+/* Bake one line of `text` at `scale_q8` into canvas `a8` (stride canvas_w),
+ * with the line's top-left anchor at (dst_x, dst_y). */
+static void bake_line_into_a8(uint8_t *a8, int canvas_w, int canvas_h,
+                              int dst_x, int dst_y,
+                              const lv_font_t *font, const char *text,
+                              uint16_t scale_q8)
 {
-    if (!slot || !slot->a8 || !font || !text) return;
-
-    if (slot->valid && slot->key_scale_q8 == scale_q8 &&
-        strncmp(slot->key_text, text, sizeof(slot->key_text)) == 0) {
-        return;  /* cache hit */
-    }
-
-    int total_w = text_width_utf8_scaled(font, text, scale_q8);
-    int total_h = text_height_utf8_scaled(font, scale_q8);
-    if (total_w <= 0 || total_h <= 0) {
-        slot->mask_w = 0;
-        slot->mask_h = 0;
-        slot->valid = true;
-        strlcpy(slot->key_text, text, sizeof(slot->key_text));
-        slot->key_scale_q8 = scale_q8;
-        return;
-    }
-    if (total_w > TEXT_SLOT_BUF_W) total_w = TEXT_SLOT_BUF_W;
-    if (total_h > TEXT_SLOT_BUF_H) total_h = TEXT_SLOT_BUF_H;
-    memset(slot->a8, 0, (size_t)total_w * (size_t)total_h);
+    if (!a8 || !font || !text || !text[0]) return;
 
     int line_h_scaled = text_height_utf8_scaled(font, scale_q8);
     int base_line_scaled = (int)(((int32_t)font->base_line * (int32_t)scale_q8 + 128) >> 8);
-    int line_top = (line_h_scaled - base_line_scaled);
+    int line_top = dst_y + (line_h_scaled - base_line_scaled);
 
-    int pen_x_q8 = 0;
+    int pen_x_q8 = (int32_t)dst_x << 8;
     size_t i = 0;
     while (text[i]) {
         size_t i_next = i;
@@ -809,21 +899,19 @@ static void bake_text_slot(text_slot_t *slot, const lv_font_t *font,
 
             for (int dy = 0; dy < dst_box_h; ++dy) {
                 int py = gy0 + dy;
-                if ((unsigned)py >= (unsigned)total_h) continue;
+                if ((unsigned)py >= (unsigned)canvas_h) continue;
                 uint32_t sy = ((uint32_t)dy * inv_q16) >> 16;
                 if (sy >= g.box_h) continue;
                 const uint8_t *src_row = &bitmap[sy * g.box_w];
-                uint8_t *dst_row = &slot->a8[py * total_w];
+                uint8_t *dst_row = &a8[py * canvas_w];
                 for (int dx = 0; dx < dst_box_w; ++dx) {
                     int px = gx0 + dx;
-                    if ((unsigned)px >= (unsigned)total_w) continue;
+                    if ((unsigned)px >= (unsigned)canvas_w) continue;
                     uint32_t sx = ((uint32_t)dx * inv_q16) >> 16;
                     if (sx >= g.box_w) continue;
-                    uint8_t a = src_row[sx];
-                    if (a == 0) continue;
-                    /* Last-writer-wins for overlapping glyphs (kerning rare
-                     * for our texts; keeps the bake branch-light). */
-                    if (a > dst_row[px]) dst_row[px] = a;
+                    uint8_t alpha = src_row[sx];
+                    if (alpha == 0) continue;
+                    if (alpha > dst_row[px]) dst_row[px] = alpha;
                 }
             }
         }
@@ -831,34 +919,148 @@ static void bake_text_slot(text_slot_t *slot, const lv_font_t *font,
         lv_font_glyph_release_draw_data(&g);
         i = i_next;
     }
-
-    slot->mask_w = (uint16_t)total_w;
-    slot->mask_h = (uint16_t)total_h;
-    slot->key_scale_q8 = scale_q8;
-    strlcpy(slot->key_text, text, sizeof(slot->key_text));
-    slot->valid = true;
 }
 
-/* Blit the slot's cached A8 mask onto s_buf at (dst_x, dst_y) using the
- * given colour and base alpha. Hot path: one row of mask = one row of
- * RGB565 writes, only touching pixels with non-zero mask alpha. */
-static void blit_text_slot(const text_slot_t *slot, int dst_x, int dst_y,
-                           uint16_t color, uint8_t base_alpha)
+static void bake_scene_text_slot(scene_text_slot_t *slot,
+                                 const char *clock_txt,
+                                 const char *date_txt,
+                                 const char *temp_txt,
+                                 const char *desc_txt)
 {
-    if (!slot || !slot->valid || !slot->a8 || base_alpha == 0) return;
-    if (slot->mask_w == 0 || slot->mask_h == 0) return;
+    if (!slot || !slot->a8) return;
 
+    scene_daypart_t daypart = scene_daypart_now();
+    if (slot->valid &&
+        slot->key_daypart == (uint8_t)daypart &&
+        strncmp(slot->key_clock, clock_txt, sizeof(slot->key_clock)) == 0 &&
+        strncmp(slot->key_date, date_txt, sizeof(slot->key_date)) == 0 &&
+        strncmp(slot->key_temp, temp_txt, sizeof(slot->key_temp)) == 0 &&
+        strncmp(slot->key_desc, desc_txt, sizeof(slot->key_desc)) == 0) {
+        return;
+    }
+
+    const lv_font_t *clock_font = &eva_font_clock_288_extralight;
+    const lv_font_t *info_font = &eva_font_uk_22;
+    const uint16_t info_scale_q8 = 256;
+    const uint16_t clock_scale_q8 = SCENE_CLOCK_SCALE_Q8;
+
+    memset(slot->a8, 0, TEXT_SLOT_BUF_BYTES);
+
+    const int canvas_w = TEXT_SLOT_BUF_W;
+    const int canvas_h = TEXT_SLOT_BUF_H;
+
+    int info_lh = text_height_utf8_scaled(info_font, info_scale_q8);
+    int top_h = 0;
+    if (date_txt[0]) {
+        top_h += info_lh;
+        if (temp_txt[0]) top_h += SCENE_INFO_LINE_GAP;
+    }
+    if (temp_txt[0]) top_h += info_lh;
+    int bottom_h = desc_txt[0] ? info_lh : 0;
+    int clock_slot_h = clock_txt[0]
+        ? text_height_utf8_scaled(clock_font, clock_scale_q8) : 0;
+
+    /* Clock on the vertical centre; date/temp and desc each sit in their own
+     * band (top edge↔clock, clock↔bottom edge) with SCENE_MARGIN padding. */
+    int clock_y = clock_slot_h > 0 ? (canvas_h - clock_slot_h) / 2 : 0;
+
+    int top_y = SCENE_MARGIN;
+    if (top_h > 0 && clock_slot_h > 0) {
+        int band_top = SCENE_MARGIN;
+        int band_bot = clock_y - SCENE_MARGIN;
+        int band_h = band_bot - band_top;
+        if (band_h > top_h) {
+            top_y = band_top + (band_h - top_h) / 2;
+        } else {
+            top_y = band_top;
+        }
+    }
+
+    int desc_y = 0;
+    if (bottom_h > 0 && clock_slot_h > 0) {
+        int band_top = clock_y + clock_slot_h + SCENE_MARGIN;
+        int band_bot = canvas_h - SCENE_MARGIN;
+        int band_h = band_bot - band_top;
+        if (band_h > bottom_h) {
+            desc_y = band_top + (band_h - bottom_h) / 2;
+        } else {
+            desc_y = band_top;
+        }
+    }
+
+    int date_w = date_txt[0] ? text_width_utf8_scaled(info_font, date_txt, info_scale_q8) : 0;
+    int temp_w = temp_txt[0] ? text_width_utf8_scaled(info_font, temp_txt, info_scale_q8) : 0;
+    int top_band_w = date_w > temp_w ? date_w : temp_w;
+    int top_x_shift = scene_top_info_x_shift(top_y, top_h, top_band_w);
+
+    int y = top_y;
+    if (date_txt[0]) {
+        int lw = date_w;
+        int x = scene_center_x(lw) + top_x_shift;
+        bake_line_into_a8(slot->a8, canvas_w, canvas_h, x, y,
+                          info_font, date_txt, info_scale_q8);
+        y += info_lh;
+        if (temp_txt[0]) y += SCENE_INFO_LINE_GAP;
+    }
+    if (temp_txt[0]) {
+        int lw = temp_w;
+        int x = scene_center_x(lw) + top_x_shift;
+        bake_line_into_a8(slot->a8, canvas_w, canvas_h, x, y,
+                          info_font, temp_txt, info_scale_q8);
+    }
+
+    if (clock_slot_h > 0) {
+        int line_w = text_width_utf8_scaled(clock_font, clock_txt, clock_scale_q8);
+        int clock_x = scene_center_x(line_w);
+        bake_line_into_a8(slot->a8, canvas_w, canvas_h, clock_x, clock_y,
+                          clock_font, clock_txt, clock_scale_q8);
+    }
+
+    if (desc_txt[0]) {
+        int lw = text_width_utf8_scaled(info_font, desc_txt, info_scale_q8);
+        int x = scene_center_x(lw);
+        bake_line_into_a8(slot->a8, canvas_w, canvas_h, x, desc_y,
+                          info_font, desc_txt, info_scale_q8);
+    }
+
+    slot->mask_w = (uint16_t)canvas_w;
+    slot->mask_h = (uint16_t)canvas_h;
+    strlcpy(slot->key_clock, clock_txt, sizeof(slot->key_clock));
+    strlcpy(slot->key_date, date_txt, sizeof(slot->key_date));
+    strlcpy(slot->key_temp, temp_txt, sizeof(slot->key_temp));
+    strlcpy(slot->key_desc, desc_txt, sizeof(slot->key_desc));
+    slot->key_clock_scale_q8 = clock_scale_q8;
+    slot->key_daypart = (uint8_t)daypart;
+    slot->valid = true;
+
+    /* Tight bbox for per-frame blit — full 800×480 scan only on text rebake. */
+    slot->bbox_valid = false;
+    int bx0 = canvas_w, by0 = canvas_h, bx1 = -1, by1 = -1;
+    for (int row = 0; row < canvas_h; ++row) {
+        const uint8_t *mrow = &slot->a8[row * canvas_w];
+        for (int col = 0; col < canvas_w; ++col) {
+            if (mrow[col] == 0) continue;
+            if (col < bx0) bx0 = col;
+            if (col > bx1) bx1 = col;
+            if (row < by0) by0 = row;
+            if (row > by1) by1 = row;
+        }
+    }
+    if (bx1 >= bx0 && by1 >= by0) {
+        slot->bbox_x0 = (uint16_t)bx0;
+        slot->bbox_y0 = (uint16_t)by0;
+        slot->bbox_x1 = (uint16_t)(bx1 + 1);
+        slot->bbox_y1 = (uint16_t)(by1 + 1);
+        slot->bbox_valid = true;
+    }
+}
+
+static void blit_text_mask_at(const scene_text_slot_t *slot, int dst_x, int dst_y,
+                              int x0, int y0, int x1, int y1,
+                              uint16_t color, uint8_t base_alpha)
+{
     int w = slot->mask_w;
     int h = slot->mask_h;
-
-    int x0 = dst_x, y0 = dst_y;
-    int x1 = dst_x + w, y1 = dst_y + h;
-    if (x0 < 0) x0 = 0;
-    if (y0 < 0) y0 = 0;
-    if (x1 > EVA_WEATHER_RENDER_W) x1 = EVA_WEATHER_RENDER_W;
-    if (y1 > EVA_WEATHER_RENDER_H) y1 = EVA_WEATHER_RENDER_H;
-    if (x0 >= x1 || y0 >= y1) return;
-
     for (int y = y0; y < y1; ++y) {
         const uint8_t *mask_row = &slot->a8[(y - dst_y) * w + (x0 - dst_x)];
         uint16_t *dst_row = &s_buf[y * EVA_WEATHER_RENDER_W + x0];
@@ -873,40 +1075,64 @@ static void blit_text_slot(const text_slot_t *slot, int dst_x, int dst_y,
     }
 }
 
+/* Blit the slot's cached A8 mask onto s_buf at (dst_x, dst_y) using the
+ * given colour and base alpha. Hot path: one row of mask = one row of
+ * RGB565 writes, only touching pixels with non-zero mask alpha. */
+static void blit_text_slot(const scene_text_slot_t *slot, int dst_x, int dst_y,
+                           uint16_t color, uint8_t base_alpha)
+{
+    if (!slot || !slot->valid || !slot->a8 || base_alpha == 0) return;
+    if (slot->mask_w == 0 || slot->mask_h == 0) return;
+
+    int w = slot->mask_w;
+    int x0 = dst_x, y0 = dst_y;
+    int x1 = dst_x + w, y1 = dst_y + (int)slot->mask_h;
+    if (slot->bbox_valid) {
+        x0 = dst_x + (int)slot->bbox_x0;
+        y0 = dst_y + (int)slot->bbox_y0;
+        x1 = dst_x + (int)slot->bbox_x1;
+        y1 = dst_y + (int)slot->bbox_y1;
+    }
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > EVA_WEATHER_RENDER_W) x1 = EVA_WEATHER_RENDER_W;
+    if (y1 > EVA_WEATHER_RENDER_H) y1 = EVA_WEATHER_RENDER_H;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    /* Soft shadow — helps clock/date read through thin cloud edges. */
+    int sh_x0 = x0 + 2;
+    int sh_y0 = y0 + 2;
+    int sh_x1 = x1 + 2;
+    int sh_y1 = y1 + 2;
+    if (sh_x0 < EVA_WEATHER_RENDER_W && sh_y0 < EVA_WEATHER_RENDER_H &&
+        sh_x0 < sh_x1 && sh_y0 < sh_y1) {
+        if (sh_x1 > EVA_WEATHER_RENDER_W) sh_x1 = EVA_WEATHER_RENDER_W;
+        if (sh_y1 > EVA_WEATHER_RENDER_H) sh_y1 = EVA_WEATHER_RENDER_H;
+        blit_text_mask_at(slot, dst_x + 2, dst_y + 2, sh_x0, sh_y0, sh_x1, sh_y1,
+                          rgb565(8, 12, 24), (uint8_t)(base_alpha * 3 / 5));
+    }
+    blit_text_mask_at(slot, dst_x, dst_y, x0, y0, x1, y1, color, base_alpha);
+}
+
 static void draw_scene_text_overlays(void)
 {
     char clock_txt[sizeof(s_clock_text)];
+    char date_txt[sizeof(s_date_text)];
     char temp_txt[sizeof(s_temp_text)];
     char desc_txt[sizeof(s_desc_text)];
     portENTER_CRITICAL(&s_text_mux);
     memcpy(clock_txt, s_clock_text, sizeof(clock_txt));
+    memcpy(date_txt, s_date_text, sizeof(date_txt));
     memcpy(temp_txt, s_temp_text, sizeof(temp_txt));
     memcpy(desc_txt, s_desc_text, sizeof(desc_txt));
     portEXIT_CRITICAL(&s_text_mux);
     clock_txt[sizeof(clock_txt) - 1] = '\0';
+    date_txt[sizeof(date_txt) - 1] = '\0';
     temp_txt[sizeof(temp_txt) - 1] = '\0';
     desc_txt[sizeof(desc_txt) - 1] = '\0';
 
-    /* Clock: native size (1.0×) by day, 0.6× downscale at night. Both bake
-     * paths go through the slot cache, so per-frame cost is just the A8 blit. */
-    const lv_font_t *clock_font = &eva_font_clock_144_extralight;
-    uint16_t clock_scale_q8 = is_night_kind(s_kind) ? 154 : 256;
-    bake_text_slot(&s_clock_slot, clock_font, clock_txt, clock_scale_q8);
-    int clock_x = (EVA_WEATHER_RENDER_W - s_clock_slot.mask_w) / 2;
-    int clock_y = (EVA_WEATHER_RENDER_H - s_clock_slot.mask_h) / 2;
-    blit_text_slot(&s_clock_slot, clock_x, clock_y, rgb565(255, 255, 255), 240);
-
-    const lv_font_t *temp_font = &lv_font_montserrat_48;
-    bake_text_slot(&s_temp_slot, temp_font, temp_txt, 256);
-    int temp_x = (EVA_WEATHER_RENDER_W - s_temp_slot.mask_w) / 2;
-    int temp_y = 56;
-    blit_text_slot(&s_temp_slot, temp_x, temp_y, rgb565(255, 255, 255), 255);
-
-    const lv_font_t *desc_font = &eva_font_uk_22;
-    bake_text_slot(&s_desc_slot, desc_font, desc_txt, 256);
-    int desc_x = (EVA_WEATHER_RENDER_W - s_desc_slot.mask_w) / 2;
-    int desc_y = 116;
-    blit_text_slot(&s_desc_slot, desc_x, desc_y, rgb565(240, 243, 248), 240);
+    bake_scene_text_slot(&s_scene_slot, clock_txt, date_txt, temp_txt, desc_txt);
+    blit_text_slot(&s_scene_slot, 0, 0, rgb565(255, 255, 255), 240);
 }
 
 static void fill_gradient(rgb_t top, rgb_t bottom)
@@ -966,21 +1192,10 @@ static void sun_events(int *out_sunrise, int *out_sunset)
     *out_sunset  = (s_sunset_min  >= 0) ? s_sunset_min  : 1080;  /* 18:00 */
 }
 
-/* Observer latitude in degrees, matching the menuconfig weather coordinates.
- * Used to compute twilight duration locally since neither provider returns
- * twilight times. */
-#define EVA_OBSERVER_LAT_FALLBACK_DEG 48.915155f
-
-static float observer_lat_deg(void)
-{
-    const char *lat_cfg = CONFIG_EVA_WEATHER_LATITUDE;
-    char *end = NULL;
-    float lat = strtof(lat_cfg, &end);
-    if (end == lat_cfg || lat < -89.9f || lat > 89.9f) {
-        return EVA_OBSERVER_LAT_FALLBACK_DEG;
-    }
-    return lat;
-}
+/* Observer latitude in degrees, matching the coordinates baked into the
+ * Open-Meteo request URL (weather_fetch_openmeteo.c). Used to compute
+ * twilight duration locally since neither provider returns twilight times. */
+#define EVA_OBSERVER_LAT_DEG 48.915155f
 
 /* Civil-twilight half-duration in minutes: how long after sunset (or before
  * sunrise) the sun takes to drop from the horizon (0°) to −6°, i.e. from
@@ -1013,7 +1228,7 @@ static float civil_twilight_minutes(void)
     const float DEG2RAD = 3.14159265f / 180.0f;
     float decl_deg = 23.44f * sinf(DEG2RAD * (360.0f / 365.0f) * (float)(doy - 81));
     float decl = decl_deg * DEG2RAD;
-    float lat  = observer_lat_deg() * DEG2RAD;
+    float lat  = EVA_OBSERVER_LAT_DEG * DEG2RAD;
 
     float cos_lat = cosf(lat), sin_lat = sinf(lat);
     float cos_decl = cosf(decl), sin_decl = sinf(decl);
@@ -1079,6 +1294,30 @@ static float sky_nightness(int m, int sr, int ss)
     return n;
 }
 
+/* Visual daypart from wall clock + sun events. Shared by clock scale, sky
+ * warmth, and text cache invalidation — independent of forced day/night kinds
+ * used only for luminary placement in weatherdebug. */
+static scene_daypart_t scene_daypart_now(void)
+{
+    int sr, ss;
+    sun_events(&sr, &ss);
+    int m = minutes_now();
+    float n = sky_nightness(m, sr, ss);
+    if (n >= 0.88f) {
+        return SCENE_DAYPART_NIGHT;
+    }
+    if (n > 0.08f) {
+        return SCENE_DAYPART_EVENING;   /* dawn or dusk twilight */
+    }
+    if (m >= sr && m < sr + 120) {
+        return SCENE_DAYPART_MORNING;
+    }
+    if (m >= ss - SCENE_EVENING_MIN && m <= ss) {
+        return SCENE_DAYPART_EVENING;
+    }
+    return SCENE_DAYPART_DAY;
+}
+
 static sky_t clear_sky_palette(int m, int sr, int ss)
 {
     /* Keyframe colours along the day. */
@@ -1113,12 +1352,25 @@ static sky_t clear_sky_palette(int m, int sr, int ss)
         float daylight = (float)(ss - sr);
         if (daylight < 1.0f) daylight = 1.0f;
         float progress = (float)(m - sr) / daylight;
-        float elev = sun_curve(progress);          /* 0 horizon .. 1 noon */
-        /* Smoothstep so the warm low-sun look lingers a bit near the
-         * horizon and midday blue dominates the middle of the day. */
+        float elev = sun_curve(progress);
+        /* Last ~105 min before sunset: pull palette toward warm dusk even
+         * when the sun is still technically above the horizon (batch evening
+         * frames at 18:56 looked like midday without this). */
+        if (m >= ss - SCENE_EVENING_MIN) {
+            float evening = (float)(ss - m) / (float)SCENE_EVENING_MIN;
+            if (evening < 0.0f) evening = 0.0f;
+            if (evening > 1.0f) evening = 1.0f;
+            elev *= (0.22f + 0.78f * evening);
+        }
         float t = elev * elev * (3.0f - 2.0f * elev);
         top = lerp_rgb(twi_top, day_top, t);
         bot = lerp_rgb(twi_bot, day_bot, t);
+        if (m >= ss - SCENE_EVENING_MIN) {
+            float evening = (float)(ss - m) / (float)SCENE_EVENING_MIN;
+            if (evening > 1.0f) evening = 1.0f;
+            top = lerp_rgb(top, twi_top, 0.55f * (1.0f - evening));
+            bot = lerp_rgb(bot, twi_bot, 0.72f * (1.0f - evening));
+        }
     } else {
         /* Nighttime: twilight → night by the shared night-ness ramp.
          * sky_nightness() clamps to 1.0 past the dusk band, so the old
@@ -1152,42 +1404,49 @@ static sky_t sky_for_kind(weather_kind_t kind)
      * reflects it). The day_* values are the previous fixed palettes, so at
      * n=0 (daytime) this reproduces the old look exactly. */
     {
-        float n = sky_nightness(m, sr, ss);
         rgb_t day_top, day_bot, night_top, night_bot;
         const char *tag;
         bool matched = true;
         switch (kind) {
         case WEATHER_RAIN:
-        case WEATHER_SLEET:
             tag = "rain";
-            day_top   = (rgb_t){ 34,  44,  60}; day_bot   = (rgb_t){ 82,  92, 104};
-            night_top = (rgb_t){ 18,  22,  30}; night_bot = (rgb_t){ 40,  46,  56};
+            day_top   = (rgb_t){ 42,  52,  68}; day_bot   = (rgb_t){ 96, 108, 118};
+            night_top = (rgb_t){ 16,  20,  28}; night_bot = (rgb_t){ 36,  42,  52};
+            break;
+        case WEATHER_SLEET:
+            tag = "sleet";
+            day_top   = (rgb_t){ 54,  62,  78}; day_bot   = (rgb_t){118, 128, 140};
+            night_top = (rgb_t){ 20,  24,  34}; night_bot = (rgb_t){ 44,  50,  62};
             break;
         case WEATHER_HEAVY_RAIN:
             tag = "heavy-rain";
             day_top   = (rgb_t){ 18,  26,  40}; day_bot   = (rgb_t){ 52,  60,  74};
-            night_top = (rgb_t){ 12,  16,  24}; night_bot = (rgb_t){ 30,  36,  46};
+            night_top = (rgb_t){ 10,  14,  22}; night_bot = (rgb_t){ 26,  32,  42};
             break;
         case WEATHER_THUNDERSTORM:
             tag = "thunderstorm";
-            day_top   = (rgb_t){ 12,  18,  30}; day_bot   = (rgb_t){ 46,  48,  58};
-            night_top = (rgb_t){ 10,  14,  22}; night_bot = (rgb_t){ 28,  32,  42};
+            day_top   = (rgb_t){ 14,  20,  34}; day_bot   = (rgb_t){ 42,  44,  54};
+            night_top = (rgb_t){  8,  12,  20}; night_bot = (rgb_t){ 22,  26,  36};
             break;
         case WEATHER_SNOW:
-        case WEATHER_HAIL:
             tag = "snow";
             day_top   = (rgb_t){116, 132, 150}; day_bot   = (rgb_t){205, 214, 220};
-            night_top = (rgb_t){ 30,  36,  46}; night_bot = (rgb_t){ 58,  66,  80};
+            night_top = (rgb_t){ 14,  18,  28}; night_bot = (rgb_t){ 32,  38,  52};
+            break;
+        case WEATHER_HAIL:
+            tag = "hail";
+            day_top   = (rgb_t){ 72,  82,  98}; day_bot   = (rgb_t){148, 156, 168};
+            night_top = (rgb_t){ 12,  16,  26}; night_bot = (rgb_t){ 28,  34,  48};
             break;
         case WEATHER_FOG:
             tag = "fog";
             day_top   = (rgb_t){130, 138, 145}; day_bot   = (rgb_t){215, 216, 210};
-            night_top = (rgb_t){ 40,  44,  52}; night_bot = (rgb_t){ 70,  74,  82};
+            night_top = (rgb_t){ 24,  28,  36}; night_bot = (rgb_t){ 46,  50,  60};
             break;
         case WEATHER_CLOUDY:
             tag = "cloudy";
             day_top   = (rgb_t){ 78,  92, 108}; day_bot   = (rgb_t){150, 160, 170};
-            night_top = (rgb_t){ 22,  26,  34}; night_bot = (rgb_t){ 42,  48,  58};
+            night_top = (rgb_t){ 16,  20,  28}; night_bot = (rgb_t){ 34,  40,  52};
             break;
         default:
             matched = false;
@@ -1195,6 +1454,11 @@ static sky_t sky_for_kind(weather_kind_t kind)
             break;
         }
         if (matched) {
+            float n = sky_nightness(m, sr, ss);
+            if (n > 0.45f) {
+                n = n * 1.12f;
+                if (n > 1.0f) n = 1.0f;
+            }
             return (sky_t){ tag,
                             lerp_rgb(day_top, night_top, n),
                             lerp_rgb(day_bot, night_bot, n) };
@@ -1563,15 +1827,15 @@ static void init_cloud_strips(void)
         for (int j = 0; j < CLOUD_VARIANT_COUNT; ++j) {
             cloud_variant_t *v = &strip->variant[j];
             if (!v->a8_light) {
-                v->a8_light = heap_caps_aligned_alloc(64, bytes,
+                v->a8_light = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             }
             if (!v->a8_shadow) {
-                v->a8_shadow = heap_caps_aligned_alloc(64, bytes,
+                v->a8_shadow = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
                                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             }
             if (!v->a8_core) {
-                v->a8_core = heap_caps_aligned_alloc(64, bytes,
+                v->a8_core = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             }
             if (!v->a8_light || !v->a8_shadow || !v->a8_core) {
@@ -1616,6 +1880,38 @@ static void draw_line(int x0, int y0, int x1, int y1, uint16_t color, uint8_t al
     }
 }
 
+/* Single-pixel Bresenham for rain streaks — skips thickness nesting. */
+static void draw_rain_streak(int x0, int y0, int x1, int y1, uint16_t color, uint8_t alpha)
+{
+    int dx = abs(x1 - x0);
+    int sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0);
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    const int w = EVA_WEATHER_RENDER_W;
+    const int h = EVA_WEATHER_RENDER_H;
+    for (;;) {
+        if ((unsigned)x0 < (unsigned)w && (unsigned)y0 < (unsigned)h) {
+            uint16_t *p = &s_buf[y0 * w + x0];
+            if (alpha >= 240) {
+                *p = color;
+            } else {
+                *p = blend565(*p, color, alpha);
+            }
+        }
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) {
+            err += dy;
+            x0 += sx;
+        }
+        if (e2 <= dx) {
+            err += dx;
+            y0 += sy;
+        }
+    }
+}
+
 /* No reset_clouds() — A8 cloud strips scroll continuously across weather
  * changes. Their geometry evolves through slow variant crossfades and
  * off-screen rebakes, while per-kind changes only affect tint/alpha. */
@@ -1641,31 +1937,29 @@ static void spawn_particle(particle_t *p, particle_kind_t kind, bool from_top, u
     p->spin = rndf(-1.0f, 1.0f);
     switch (kind) {
     case P_RAIN:
-        /* Base vy 330..540 px/s. Horizontal velocity = wind bias + small
-         * natural turbulence jitter. When wind is unknown (-1 from state),
-         * s_wind_vx_bias is 0 and rain falls effectively straight. */
+        /* Outdoor rain (behind glass): free-fall streaks, much faster than
+         * glass-slide droplets. vy ~480–900 px/s ≈ 8–20× glass terminal. */
     {
         float light = (s_density_scale < 0.70f) ? 0.68f : 1.0f;
-        p->vx = (wind_vx + rndf(-20.0f, 20.0f)) * speed_z;
-        p->vy = rndf(330.0f, 540.0f) * speed_z;
-        p->size = rndf(7.0f, 15.0f) * size_z * light;
+        float heavy = (s_kind == WEATHER_HEAVY_RAIN || s_kind == WEATHER_THUNDERSTORM)
+            ? 1.12f : 1.0f;
+        p->vx = (wind_vx + rndf(-24.0f, 24.0f)) * speed_z;
+        p->vy = rndf(480.0f, 900.0f) * speed_z * light * heavy;
+        p->size = rndf(8.0f, 18.0f) * size_z * light;
         p->alpha = rndf(0.38f, 0.72f) * alpha_z * light;
         break;
     }
     case P_SNOW:
-        /* Snow is much lighter — wind effect is ~30 % of rain's, plus a
-         * symmetric jitter for natural wobble. */
         p->vx = (wind_vx * 0.30f + rndf(-14.0f, 14.0f)) * speed_z;
-        p->vy = rndf(28.0f, 86.0f) * speed_z;
-        p->size = rndf(1.4f, 3.8f) * size_z;
-        p->alpha = rndf(0.45f, 0.90f) * alpha_z;
+        p->vy = rndf(22.0f, 68.0f) * speed_z;
+        p->size = rndf(2.0f, 5.5f) * size_z;
+        p->alpha = rndf(0.32f, 0.72f) * alpha_z;
         break;
     case P_HAIL:
-        /* Hail is heavy — wind effect is only ~15 % of rain's. */
-        p->vx = (wind_vx * 0.15f + rndf(-25.0f, 25.0f)) * speed_z;
-        p->vy = rndf(360.0f, 620.0f) * speed_z;
-        p->size = rndf(2.0f, 5.0f) * size_z;
-        p->alpha = rndf(0.72f, 0.95f) * alpha_z;
+        p->vx = (wind_vx * 0.22f + rndf(-30.0f, 30.0f)) * speed_z;
+        p->vy = rndf(420.0f, 720.0f) * speed_z;
+        p->size = rndf(3.0f, 6.5f) * size_z;
+        p->alpha = rndf(0.82f, 1.0f) * alpha_z;
         break;
     case P_STAR:
         p->y = rndf(58.0f, EVA_WEATHER_RENDER_H * 0.58f);
@@ -1702,11 +1996,14 @@ static particle_kind_t particle_kind_for_slot(uint16_t slot)
     case WEATHER_HEAVY_RAIN:
         return P_RAIN;
     case WEATHER_THUNDERSTORM:
+        if (s_precip_type == PRECIP_HAIL) {
+            return (slot % 4 == 0) ? P_HAIL : P_RAIN;
+        }
         return P_RAIN;
     case WEATHER_SNOW:
         return P_SNOW;
     case WEATHER_SLEET:
-        return (slot & 1) ? P_SNOW : P_RAIN;
+        return (slot % 3 == 0) ? P_RAIN : P_SNOW;
     case WEATHER_HAIL:
         return P_HAIL;
     case WEATHER_FOG:
@@ -1800,6 +2097,13 @@ static bool is_night_kind(weather_kind_t kind)
         return (m < sr || m >= ss);
     }
     return (m >= ss && m < sr);
+}
+
+static bool weather_kind_has_precip_particles(weather_kind_t kind)
+{
+    return kind == WEATHER_RAIN || kind == WEATHER_HEAVY_RAIN ||
+           kind == WEATHER_THUNDERSTORM || kind == WEATHER_SLEET ||
+           kind == WEATHER_HAIL || kind == WEATHER_SNOW;
 }
 
 /* Single-pass moon renderer that draws only the lit fraction, using the
@@ -1987,7 +2291,7 @@ static void draw_sun_or_moon(float t)
 
     if (is_night_kind(s_kind)) {
         /* Default hardcoded position if moon astronomy isn't available yet. */
-        float mx = 0.75f, my = 0.27f;
+        float mx = 0.82f, my = 0.22f;
         float progress = arc_progress(s_moonrise_min, s_moonset_min, m);
         if (progress >= 0.0f) {
             float angle = progress * 3.1415926f;
@@ -2047,27 +2351,18 @@ static void draw_sun_or_moon(float t)
     float sun_y_n = SUN_HORIZON_Y - arc * (SUN_HORIZON_Y - SUN_APEX_Y);
     int sun_x = (int)(EVA_WEATHER_RENDER_W * sun_x_n);
     int sun_y = (int)(EVA_WEATHER_RENDER_H * sun_y_n);
-    /* Real phone photos show a small white saturated core with most of the
-     * perceived size coming from glare. Keep the disc compact and let the
-     * sky-glare/god-ray passes sell the brightness. */
-    /* Disc + glow radii on the Fibonacci ladder, capped at 89 px. The old
-     * code used r*8 (~144 px) for the outer glow — a huge filled circle that
-     * was the dominant cost on clear sky. Now the disc is ~21 px and the glow
-     * layers step 34 → 55 → 89 px, so the painted area is far smaller while
-     * still reading as a bright sun with a soft halo. */
-    int r = FIB_21;                              /* compact disc ~21 px */
-    uint8_t a_outer  = (uint8_t)((float)FIB_21 * vis * (0.65f + 0.35f * horizon_boost));
-    uint8_t a_corona = (uint8_t)((float)FIB_34 * vis * (0.75f + 0.25f * horizon_boost));
+    /* Disc + glow on the Fibonacci ladder, 2× former size:
+     * disc FIB_34+FIB_8=42 px (was FIB_21), halo steps 55→89→144 px. */
+    const int r = FIB_34 + FIB_8;
+    uint8_t a_outer  = (uint8_t)((float)FIB_34 * vis * (0.65f + 0.35f * horizon_boost));
+    uint8_t a_corona = (uint8_t)((float)FIB_55 * vis * (0.75f + 0.25f * horizon_boost));
     uint8_t a_glow   = (uint8_t)((float)FIB_89 * vis_disc * (0.85f + 0.15f * horizon_boost));
     uint8_t a_disc   = (uint8_t)((float)255 * vis_disc);
-    if (a_outer)  draw_filled_circle(sun_x, sun_y, FIB_89, rgb565(210, 232, 255), a_outer);
-    if (a_corona) draw_filled_circle(sun_x, sun_y, FIB_55, rgb565(255, 244, 204), a_corona);
-    if (a_glow)   draw_filled_circle(sun_x, sun_y, FIB_34, rgb565(255, 252, 220), a_glow);
-    if (a_disc)   draw_filled_circle(sun_x, sun_y, r,      rgb565(255, 255, 246), a_disc);
+    if (a_outer)  draw_filled_circle(sun_x, sun_y, FIB_144, rgb565(255, 224, 148), a_outer);
+    if (a_corona) draw_filled_circle(sun_x, sun_y, FIB_89,  rgb565(255, 210,  88), a_corona);
+    if (a_glow)   draw_filled_circle(sun_x, sun_y, FIB_55,  rgb565(255, 228, 108), a_glow);
+    if (a_disc)   draw_filled_circle(sun_x, sun_y, r,       rgb565(255, 236, 120), a_disc);
 
-    /* Remember sun position + radius so the post-cloud god-ray pass (drawn
-     * after the cloud composite) can paint a warm light overlay through the
-     * cloud cover — sun should illuminate, not be hidden behind clouds. */
     s_sun_x = sun_x;
     s_sun_y = sun_y;
     s_sun_r = r;
@@ -2094,33 +2389,55 @@ static void draw_sun_or_moon(float t)
  * ring set tops out at 89 px so the painted area is tiny and cheap, while
  * still giving the sun a soft warm glow that bleeds onto nearby clouds.
  * Rings go outer→inner so the brighter inner ones overpaint. */
-static void draw_sun_god_rays(float t)
+/* Animated outer halo — Fibonacci radii/periods, painted every frame on s_buf
+ * (sky cache holds the static disc+glow from draw_sun_or_moon). Cheap filled
+ * circles + FIB_8 short rays; no full-frame pixel scan. */
+static void draw_sun_fib_light(float t)
 {
-    (void)t;
     if (!s_sun_visible || s_sun_r <= 0) return;
     if (is_night_kind(s_kind)) return;
-    bool stormy = (s_kind == WEATHER_THUNDERSTORM || s_kind == WEATHER_HEAVY_RAIN);
-    if (stormy) return;
+    if (s_kind == WEATHER_THUNDERSTORM || s_kind == WEATHER_HEAVY_RAIN) return;
 
-    /* Dimmer halo under heavy cover, brighter through clear gaps. */
     float cover = sky_cover_fraction();
-    float halo_vis = 1.0f - cover * 0.6f;
-    if (halo_vis < 0.20f) halo_vis = 0.20f;
+    float k = (1.0f - cover * 0.58f) * s_sun_strength;
+    if (k < 0.18f) k = 0.18f;
 
-    /* radius (px) → base alpha. Farther = fainter. Capped at 89 px. */
-    /* Only the outer rings — the inner ones overlap the sun disc/glow drawn
-     * by draw_sun_or_moon() and just cost extra filled-circle passes. Three
-     * rings give a smooth outer halo. */
-    static const struct { int r; float a; } rings[] = {
-        { FIB_89, 7.0f }, { FIB_55, 12.0f }, { FIB_34, 18.0f },
+    static const struct { int r; float base_a; int freq_n; int freq_d; float phase; } rings[] = {
+        { FIB_233, 5.0f,  FIB_2, FIB_144, 0.0f },
+        { FIB_144, 8.5f,  FIB_3, FIB_89,  (float)FIB_5 / (float)FIB_3 },
+        { FIB_89,  12.0f, FIB_5, FIB_55,  (float)FIB_8 / (float)FIB_5 },
     };
     const uint16_t warm = rgb565(255, 226, 168);
+    const uint16_t pale = rgb565(255, 244, 210);
     for (size_t i = 0; i < sizeof(rings) / sizeof(rings[0]); ++i) {
-        uint8_t a = (uint8_t)(rings[i].a * halo_vis);
-        if (a) {
-            draw_filled_circle(s_sun_x, s_sun_y, rings[i].r, warm, a);
-        }
+        float pulse = 0.50f + 0.50f * sinf(t * (float)rings[i].freq_n / (float)rings[i].freq_d
+                                            + rings[i].phase);
+        uint8_t a = (uint8_t)(rings[i].base_a * pulse * k);
+        if (a < FIB_3) continue;
+        draw_filled_circle(s_sun_x, s_sun_y, rings[i].r,
+                           (i == 0) ? pale : warm, a);
     }
+
+    /* FIB_8 soft rays — slow rotation (period ~FIB_377/FIB_2 s), twinkle per ray. */
+    const float rot = t * (float)FIB_2 / (float)FIB_377;
+    const float step = 6.2831853f / (float)FIB_8;
+    for (int i = 0; i < FIB_8; ++i) {
+        float ray_pulse = 0.38f + 0.62f * sinf(t * (float)FIB_3 / (float)FIB_89
+                                               + (float)i * step);
+        if (ray_pulse < 0.40f) continue;
+        float ang = rot + (float)i * step;
+        int len = FIB_34 + (int)((float)FIB_21 * ray_pulse);
+        int ex = s_sun_x + (int)(cosf(ang) * (float)len);
+        int ey = s_sun_y + (int)(sinf(ang) * (float)len);
+        uint8_t a = (uint8_t)((float)FIB_13 * ray_pulse * k);
+        if (a < FIB_2) continue;
+        draw_rain_streak(s_sun_x, s_sun_y, ex, ey, warm, a);
+    }
+}
+
+static void draw_sun_god_rays(float t)
+{
+    draw_sun_fib_light(t);
 }
 
 /* Helper PRNG for procedural sprite generation, seeded per sprite */
@@ -2200,7 +2517,7 @@ static void cloud_sprite_atlas_init_if_needed(void)
 
     for (int i = 0; i < CLOUD_SPRITE_ATLAS_COUNT; ++i) {
         /* Allocate A8 data buffer in PSRAM (64-byte aligned for DMA/PPA) */
-        s_cloud_atlas[i].a8_data = (uint8_t *)heap_caps_aligned_alloc(64, CLOUD_SPRITE_BYTES,
+        s_cloud_atlas[i].a8_data = (uint8_t *)heap_caps_aligned_alloc(PPA_CACHE_ALIGN, CLOUD_SPRITE_BYTES,
                                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!s_cloud_atlas[i].a8_data) {
             ESP_LOGE(TAG, "Failed to allocate cloud sprite %d", i);
@@ -2382,11 +2699,17 @@ static void update_cloud_tints(void)
     bool night = is_night_kind(s_kind);
 
     if (foggy) {
-        /* Fog: low contrast between light/shadow — fog is omnidirectional
-         * scattering, no clear sun direction. Both tints are warm-grey. */
-        set_tint(&s_strip[CLOUD_LAYER_HIGH], 232, 232, 226, 195, 195, 190, 178, 178, 172);
-        set_tint(&s_strip[CLOUD_LAYER_MID],  220, 218, 212, 175, 175, 170, 155, 155, 150);
-        set_tint(&s_strip[CLOUD_LAYER_LOW],  208, 208, 202, 158, 158, 154, 136, 136, 132);
+        if (night) {
+            set_tint(&s_strip[CLOUD_LAYER_HIGH], 118, 120, 124,  72,  74,  78,  58,  60,  64);
+            set_tint(&s_strip[CLOUD_LAYER_MID],  104, 106, 110,  58,  60,  64,  46,  48,  52);
+            set_tint(&s_strip[CLOUD_LAYER_LOW],   92,  94,  98,  46,  48,  52,  36,  38,  42);
+        } else {
+            /* Fog: low contrast between light/shadow — fog is omnidirectional
+             * scattering, no clear sun direction. Both tints are warm-grey. */
+            set_tint(&s_strip[CLOUD_LAYER_HIGH], 232, 232, 226, 195, 195, 190, 178, 178, 172);
+            set_tint(&s_strip[CLOUD_LAYER_MID],  220, 218, 212, 175, 175, 170, 155, 155, 150);
+            set_tint(&s_strip[CLOUD_LAYER_LOW],  208, 208, 202, 158, 158, 154, 136, 136, 132);
+        }
     } else if (stormy) {
         /* Storm: dramatic top/bottom contrast — cumulonimbus signature.
          * Top still gets some light through anvil edges (~mid grey).
@@ -2454,6 +2777,8 @@ static void update_cloud_tints(void)
         uint16_t max_alpha = (uint16_t)(FIB_233 + FIB_21);
         if (!stormy && !foggy && !night && pct > 0) {
             max_alpha = 255;
+        } else if (night && !stormy && !foggy && pct > 0) {
+            max_alpha = (uint16_t)((max_alpha * 72) / 100);
         }
         s_strip[i].alpha_scale = pct == 0 ? 0
                                           : (uint8_t)((pct * max_alpha + 50) / 100);
@@ -2543,7 +2868,8 @@ static void blend_mask_cpu(const cloud_strip_t *strip,
                            const uint8_t *mask,
                            uint8_t tr, uint8_t tg, uint8_t tb,
                            uint8_t alpha_scale,
-                           int eff_y, int src_x, int dst_x, int width)
+                           int eff_y, int src_x, int dst_x, int width,
+                           bool bg_from_sky)
 {
     if (!mask || width <= 0 || alpha_scale == 0) return;
     uint16_t tint = rgb565(tr, tg, tb);
@@ -2551,10 +2877,20 @@ static void blend_mask_cpu(const cloud_strip_t *strip,
         const uint8_t *src = &mask[y * CLOUD_STRIP_W + src_x];
         int dst_y = eff_y + y;
         if ((unsigned)dst_y >= EVA_WEATHER_RENDER_H) continue;
+        uint16_t *dst_row = &s_buf[dst_y * EVA_WEATHER_RENDER_W + dst_x];
+        const uint16_t *sky_row = (bg_from_sky && s_bg_buf)
+            ? &s_bg_buf[dst_y * EVA_WEATHER_RENDER_W + dst_x] : NULL;
         for (int x = 0; x < width; ++x) {
             uint8_t a = (uint8_t)(((uint16_t)src[x] * alpha_scale) / 255);
             if (a) {
-                blend_px(dst_x + x, dst_y, tint, a);
+                uint16_t base = sky_row ? sky_row[x] : dst_row[x];
+                if (a >= 240) {
+                    dst_row[x] = tint;
+                } else {
+                    dst_row[x] = blend565(base, tint, a);
+                }
+            } else if (sky_row) {
+                dst_row[x] = sky_row[x];
             }
         }
     }
@@ -2565,7 +2901,8 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
                                          uint8_t tr, uint8_t tg, uint8_t tb,
                                          uint8_t alpha_scale,
                                          int eff_y,
-                                         int src_x, int dst_x, int width)
+                                         int src_x, int dst_x, int width,
+                                         bool bg_from_sky)
 {
     if (!s_ppa_blend || s_ppa_blend_disabled || !mask || alpha_scale == 0 || width <= 0) {
         return ESP_FAIL;
@@ -2586,9 +2923,10 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
     }
     if (strip_h <= 0) return ESP_OK;   /* fully off-screen: skip silently */
 
+    const bool use_sky_bg = bg_from_sky && s_bg_buf;
     ppa_blend_oper_config_t cfg = {
         .in_bg = {
-            .buffer = s_buf,
+            .buffer = use_sky_bg ? (void *)s_bg_buf : (void *)s_buf,
             .pic_w = EVA_WEATHER_RENDER_W,
             .pic_h = EVA_WEATHER_RENDER_H,
             .block_w = (uint32_t)width,
@@ -2621,7 +2959,11 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
         .fg_fix_rgb_val = { .b = tb, .g = tg, .r = tr },
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
-    return ppa_do_blend(s_ppa_blend, &cfg);
+    esp_err_t err = ppa_do_blend(s_ppa_blend, &cfg);
+    if (err == ESP_OK && bg_from_sky && s_blend_from_sky) {
+        s_blend_from_sky = false;
+    }
+    return err;
 }
 
 /* Composite one layer: shadow mask first (under the sky), light mask over.
@@ -2630,7 +2972,8 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
  * but stops the layer feeling locked into a fixed band. */
 static void blend_layer_variant(cloud_strip_t *strip,
                                 const cloud_variant_t *v,
-                                uint8_t alpha_scale)
+                                uint8_t alpha_scale,
+                                bool sky_wrap)
 {
     if (!v || !v->a8_light || !v->a8_shadow || !v->a8_core || alpha_scale == 0) return;
 
@@ -2704,14 +3047,18 @@ static void blend_layer_variant(cloud_strip_t *strip,
                                        strip->tint_light_g,
                                        strip->tint_light_b,
                                        light_alpha,
-                                       eff_y, scroll, 0, first_w);
+                                       eff_y, scroll, 0, first_w,
+                                       s_blend_from_sky);
         if (err == ESP_OK && second_w > 0) {
+            /* Wrap band sits right of the seam; s_buf there still holds last
+             * frame's rain/text unless we read the cached sky as bg. */
             err = blend_mask_ppa_one_band(strip, v->a8_light,
                                            strip->tint_light_r,
                                            strip->tint_light_g,
                                            strip->tint_light_b,
                                            light_alpha,
-                                           eff_y, 0, first_w, second_w);
+                                           eff_y, 0, first_w, second_w,
+                                           sky_wrap);
         }
     }
     if (err == ESP_OK) return;
@@ -2724,12 +3071,12 @@ static void blend_layer_variant(cloud_strip_t *strip,
         blend_mask_cpu(strip, v->a8_light,
                        strip->tint_light_r, strip->tint_light_g, strip->tint_light_b,
                        light_alpha,
-                       eff_y, scroll, 0, first_w);
+                       eff_y, scroll, 0, first_w, s_blend_from_sky);
         if (second_w > 0) {
             blend_mask_cpu(strip, v->a8_light,
                            strip->tint_light_r, strip->tint_light_g, strip->tint_light_b,
                            light_alpha,
-                           eff_y, 0, first_w, second_w);
+                           eff_y, 0, first_w, second_w, sky_wrap);
         }
     }
 }
@@ -2774,18 +3121,18 @@ static void update_cloud_lifecycle(float dt)
     }
 }
 
-static void blend_layer(cloud_strip_t *strip)
+static bool blend_layer(cloud_strip_t *strip, bool sky_wrap)
 {
     /* Below this threshold the layer would only contribute imperceptible
      * pixels (alpha < FIB_8 ≈ 3 %) but still trigger 3 PPA blends. Skip it
      * so clear-day (cloud_pct~5) doesn't pay the full cloudy cost. */
-    if (strip->alpha_scale < FIB_8) return;
+    if (strip->alpha_scale < FIB_8) return false;
 
     uint8_t active = strip->active_variant;
     uint8_t next = active ^ 1U;
     if (!strip->morphing) {
-        blend_layer_variant(strip, &strip->variant[active], strip->alpha_scale);
-        return;
+        blend_layer_variant(strip, &strip->variant[active], strip->alpha_scale, sky_wrap);
+        return true;
     }
 
     float t = strip->morph_t;
@@ -2794,8 +3141,9 @@ static void blend_layer(cloud_strip_t *strip)
     float eased = t * t * (3.0f - 2.0f * t);
     uint8_t a0 = alpha_scaled_by_float(strip->alpha_scale, 1.0f - eased);
     uint8_t a1 = alpha_scaled_by_float(strip->alpha_scale, eased);
-    blend_layer_variant(strip, &strip->variant[active], a0);
-    blend_layer_variant(strip, &strip->variant[next], a1);
+    blend_layer_variant(strip, &strip->variant[active], a0, sky_wrap);
+    blend_layer_variant(strip, &strip->variant[next], a1, sky_wrap);
+    return true;
 }
 
 static void draw_sun_cloud_light_variant(const cloud_strip_t *strip,
@@ -2814,7 +3162,7 @@ static void draw_sun_cloud_light_variant(const cloud_strip_t *strip,
      * iterations per frame, one of the two big CPU costs. FIB_144 (+ a small
      * sun-strength term) keeps the lit halo tight around the sun where it's
      * actually visible, cutting the scanned area ~5×. */
-    int r = (int)((float)FIB_144 + 34.0f * s_sun_strength);
+    int r = (int)((float)FIB_233 + (float)FIB_34 * s_sun_strength);
     int r2 = r * r;
     int x0 = s_sun_x - r;
     int x1 = s_sun_x + r;
@@ -2893,21 +3241,20 @@ static void draw_sun_cloud_lighting(void)
     }
 }
 
-static void compose_clouds_into_working_buffer(float dt)
+static void advance_cloud_frame(float dt)
 {
     update_cloud_tints();
     update_cloud_lifecycle(dt);
     advance_cloud_scroll(dt);
-    /* All three layers render (HIGH cirrus top → MID altocumulus → LOW
-     * cumulus bottom) so clouds fill the whole sky, not just the lower band.
-     * This is affordable now: the panel rotation moved to the PPA DMA engine
-     * (no per-frame CPU sw_rotate), the cloud blend itself is light-only and
-     * each layer's bake uses fewer blobs (see bake_strip_*), so the combined
-     * blend is only a few ms. blend_layer() early-outs on near-zero cover, so
-     * thin/clear layers cost nothing. */
-    blend_layer(&s_strip[CLOUD_LAYER_HIGH]);
-    blend_layer(&s_strip[CLOUD_LAYER_MID]);
-    blend_layer(&s_strip[CLOUD_LAYER_LOW]);
+}
+
+static void compose_clouds_into_working_buffer(float dt)
+{
+    advance_cloud_frame(dt);
+    bool sky_wrap = true;
+    if (blend_layer(&s_strip[CLOUD_LAYER_HIGH], sky_wrap)) sky_wrap = false;
+    if (blend_layer(&s_strip[CLOUD_LAYER_MID], sky_wrap)) sky_wrap = false;
+    (void)blend_layer(&s_strip[CLOUD_LAYER_LOW], sky_wrap);
 }
 
 static void update_and_draw_particles(float dt, float t)
@@ -2934,15 +3281,19 @@ static void update_and_draw_particles(float dt, float t)
              * p->size; horizontal extent is size * (vx/vy) ratio. vy is
              * always > 0 for rain so no divide-by-zero. */
             float vy_safe = (p->vy > 1.0f) ? p->vy : 1.0f;
-            int x1 = x0 + (int)(p->size * (p->vx / vy_safe));
-            int y1 = y0 + (int)p->size;
-            draw_line(x0, y0, x1, y1,
-                      rgb565(214, 234, 255), alpha, p->size > 14.0f ? 1 : 0);
+            float slen = p->size * (0.85f + fminf(p->vy / 900.0f, 0.35f));
+            int x1 = x0 - (int)(slen * (p->vx / vy_safe));
+            int y1 = y0 - (int)slen;
+            if (p->size > 14.0f) {
+                draw_line(x1, y1, x0, y0, rgb565(214, 234, 255), alpha, 1);
+            } else {
+                draw_rain_streak(x1, y1, x0, y0, rgb565(214, 234, 255), alpha);
+            }
             break;
         }
         case P_SNOW: {
-            float sway_amp = 16.0f + fminf(s_wind_kph_eff, 60.0f) * 0.25f;
-            float sway = sinf(t * (0.5f + fabsf(p->spin) * 0.5f) + p->phase) * sway_amp;
+            float sway_amp = 20.0f + fminf(s_wind_kph_eff, 60.0f) * 0.30f;
+            float sway = sinf(t * (0.35f + fabsf(p->spin) * 0.35f) + p->phase) * sway_amp;
             p->x += (p->vx + sway) * dt;
             p->y += p->vy * dt;
             p->phase += p->spin * dt;
@@ -2951,13 +3302,16 @@ static void update_and_draw_particles(float dt, float t)
             }
             if (p->x < -12.0f) p->x = EVA_WEATHER_RENDER_W + 8.0f;
             if (p->x > EVA_WEATHER_RENDER_W + 12.0f) p->x = -8.0f;
-            uint8_t alpha = clamp_u8((int)(p->alpha * 205.0f));
+            uint8_t alpha = clamp_u8((int)(p->alpha * 180.0f));
             int x = (int)p->x;
             int y = (int)p->y;
             int r = (int)p->size;
-            draw_line(x - r, y, x + r, y, rgb565(255, 255, 255), alpha, 0);
-            draw_line(x, y - r, x, y + r, rgb565(255, 255, 255), alpha, 0);
-            blend_px(x, y, rgb565(255, 255, 255), alpha);
+            uint16_t col = rgb565(240, 246, 255);
+            draw_filled_circle(x, y, r, col, alpha);
+            if (r > 2) {
+                draw_filled_circle(x, y, r - 1, rgb565(255, 255, 255),
+                                   (uint8_t)(alpha * 3 / 5));
+            }
             break;
         }
         case P_HAIL: {
@@ -2967,8 +3321,13 @@ static void update_and_draw_particles(float dt, float t)
                 p->x < -20.0f || p->x > EVA_WEATHER_RENDER_W + 20.0f) {
                 spawn_particle(p, P_HAIL, true, i);
             }
-            draw_filled_circle((int)p->x, (int)p->y, (int)p->size,
-                               rgb565(238, 248, 255), clamp_u8((int)(p->alpha * 230.0f)));
+            int x = (int)p->x;
+            int y = (int)p->y;
+            int r = (int)p->size;
+            uint8_t alpha = clamp_u8((int)(p->alpha * 240.0f));
+            draw_filled_circle(x, y, r, rgb565(210, 222, 238), alpha);
+            draw_filled_circle(x - 1, y - 1, r / 2 + 1, rgb565(255, 255, 255),
+                               (uint8_t)(alpha * 4 / 5));
             break;
         }
         case P_STAR: {
@@ -2993,8 +3352,10 @@ static void update_and_draw_particles(float dt, float t)
             p->x += p->vx * dt;
             if (p->x < -120.0f) p->x = EVA_WEATHER_RENDER_W + 80.0f;
             if (p->x > EVA_WEATHER_RENDER_W + 120.0f) p->x = -80.0f;
-            draw_filled_circle((int)p->x, (int)p->y, (int)p->size,
-                               rgb565(220, 222, 216), clamp_u8((int)(p->alpha * 180.0f)));
+            uint16_t col = is_night_kind(s_kind) ? rgb565(148, 152, 160)
+                                                 : rgb565(220, 222, 216);
+            uint8_t alpha = clamp_u8((int)(p->alpha * (is_night_kind(s_kind) ? 120.0f : 180.0f)));
+            draw_filled_circle((int)p->x, (int)p->y, (int)p->size, col, alpha);
             break;
         }
         default:
@@ -3014,15 +3375,16 @@ static void update_and_draw_particles(float dt, float t)
  */
 static void update_lightning(float t)
 {
-    if (s_kind != WEATHER_THUNDERSTORM) {
+    if (s_kind != WEATHER_THUNDERSTORM && s_kind != WEATHER_HAIL) {
         s_lightning_alpha = 0.0f;
         s_lightning_cooldown = 0;
         return;
     }
     float p = sinf(t * 2.5f) * sinf(t * 5.3f) * sinf(t * 7.1f);
+    float trigger = (s_kind == WEATHER_HAIL) ? 0.66f : 0.58f;
     if (s_lightning_cooldown > 0) {
         s_lightning_cooldown--;
-    } else if (p > 0.58f && s_lightning_alpha < (float)FIB_5) {
+    } else if (p > trigger && s_lightning_alpha < (float)FIB_5) {
         /* Initial lightning brightness: FIB_144 + FIB_34 = 178 baseline plus
          * up to FIB_55 jitter — that gives a flash alpha in 178..233 (uint8
          * range cap is 255, so we stay just below saturation). Decay below
@@ -3050,7 +3412,11 @@ static void composite_lightning_on_render(void)
     for (int y = 0; y < EVA_WEATHER_RENDER_H; ++y) {
         uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
         for (int x = y & 1; x < EVA_WEATHER_RENDER_W; x += 2) {
-            row[x] = blend565(row[x], white, alpha);
+            if (alpha >= 240) {
+                row[x] = white;
+            } else {
+                row[x] = blend565(row[x], white, alpha);
+            }
         }
     }
     uint16_t bolt = rgb565(238, 246, 255);
@@ -3063,6 +3429,305 @@ static void composite_lightning_on_render(void)
                   s_lightning_x[i], s_lightning_y[i],
                   bolt, clamp_u8(alpha + FIB_34), 1);
     }
+}
+
+/* --- Glass overlay (topmost layer) ----------------------------------------
+ * Simulates a protective glass panel: sun specular glints when the disc is
+ * up, and slow sliding droplets during rain. Drawn after lightning so it
+ * always reads as foreground. */
+static void reset_glass_overlay_for_kind(void)
+{
+    s_glass_drops_inited = false;
+}
+
+static void ensure_glass_glints(void)
+{
+    if (s_glass_glints_inited) return;
+    for (int i = 0; i < GLASS_GLINT_MAX; ++i) {
+        glass_glint_t *g = &s_glass_glints[i];
+        g->x = rndf(48.0f, (float)EVA_WEATHER_RENDER_W - 48.0f);
+        g->y = rndf(24.0f, (float)EVA_WEATHER_RENDER_H * 0.58f);
+        g->len = rndf(16.0f, 44.0f);
+        g->phase = rndf(0.0f, 6.2831853f);
+        g->strength = rndf(0.45f, 1.0f);
+    }
+    s_glass_glints_inited = true;
+}
+
+static uint16_t glass_drop_target_for_kind(weather_kind_t kind)
+{
+    switch (kind) {
+    case WEATHER_HEAVY_RAIN:
+    case WEATHER_THUNDERSTORM:
+        return GLASS_DROP_MAX;
+    case WEATHER_RAIN:
+    case WEATHER_SLEET:
+        return FIB_21;
+    default:
+        return 0;
+    }
+}
+
+static float glass_slide_quota_px(float y)
+{
+    float room = (float)EVA_WEATHER_RENDER_H - y - 12.0f;
+    if (room < 20.0f) room = 20.0f;
+    float q = room * rndf(0.07f, 0.38f);
+    if (q < 18.0f) q = 18.0f;
+    if (q > 145.0f) q = 145.0f;
+    return q;
+}
+
+static float glass_ease_smooth(float t)
+{
+    if (t <= 0.0f) return 0.0f;
+    if (t >= 1.0f) return 1.0f;
+    return t * t * (3.0f - 2.0f * t);
+}
+
+static float glass_drop_v_term(float r)
+{
+    float vt = GLASS_VTERM_BASE + r * GLASS_VTERM_PER_R;
+    if (s_kind == WEATHER_HEAVY_RAIN || s_kind == WEATHER_THUNDERSTORM) {
+        vt *= 1.14f;
+    }
+    return vt;
+}
+
+static void glass_drop_begin_dry(glass_drop_t *d)
+{
+    d->state = GLASS_DROP_DRYING;
+    d->vy = 0.0f;
+    d->vx *= 0.35f;
+    d->fade_total = rndf(0.07f, 0.38f);
+    d->timer = d->fade_total;
+}
+
+static void respawn_glass_drop(glass_drop_t *d)
+{
+    d->target_r = rndf(2.4f, 5.0f);
+    d->r = d->target_r * rndf(0.30f, 0.48f);
+    d->v_term = glass_drop_v_term(d->r) + rndf(0.0f, 6.0f);
+    d->phase = rndf(0.0f, 6.2831853f);
+    d->alpha_peak = rndf(0.44f, 0.90f);
+    d->alpha = d->alpha_peak;
+    d->vx = -s_wind_vx_bias * 0.07f + rndf(-2.0f, 2.0f);
+    d->vy = 0.0f;
+    d->dist_slid = 0.0f;
+    d->form_total = 0.0f;
+    d->fade_total = 0.0f;
+    d->x = rndf(28.0f, (float)EVA_WEATHER_RENDER_W - 28.0f);
+
+    float roll = rndf(0.0f, 1.0f);
+    if (roll < 0.50f) {
+        /* Condensation bead: appears on the pane, grows, then slides or dries. */
+        d->state = GLASS_DROP_FORMING;
+        d->y = rndf((float)EVA_WEATHER_RENDER_H * 0.05f,
+                    (float)EVA_WEATHER_RENDER_H * 0.90f);
+        d->form_total = rndf(0.30f, 1.50f);
+        d->timer = d->form_total;
+        d->r = d->target_r * rndf(0.22f, 0.40f);
+        d->will_slide = rndf(0.0f, 1.0f) > 0.14f;
+        d->slide_quota = glass_slide_quota_px(d->y);
+    } else if (roll < 0.80f) {
+        /* Already sliding mid-pane — not spawned from the top edge. */
+        d->r = d->target_r;
+        d->v_term = glass_drop_v_term(d->r);
+        d->state = GLASS_DROP_SLIDING;
+        d->y = rndf((float)EVA_WEATHER_RENDER_H * 0.04f,
+                    (float)EVA_WEATHER_RENDER_H * 0.76f);
+        d->vy = rndf(0.0f, d->v_term * 0.55f);
+        d->slide_quota = glass_slide_quota_px(d->y);
+        d->will_slide = true;
+    } else {
+        /* Upper band entry: only a short run, rarely the full pane height. */
+        d->r = d->target_r;
+        d->v_term = glass_drop_v_term(d->r);
+        d->state = GLASS_DROP_SLIDING;
+        d->y = rndf(-18.0f, (float)EVA_WEATHER_RENDER_H * 0.14f);
+        d->vy = rndf(0.0f, d->v_term * 0.22f);
+        d->slide_quota = rndf(28.0f, 118.0f);
+        d->will_slide = true;
+    }
+}
+
+static void ensure_glass_drops(void)
+{
+    uint16_t target = glass_drop_target_for_kind(s_kind);
+    if (target == 0) {
+        s_glass_drops_inited = false;
+        return;
+    }
+    if (s_glass_drops_inited) return;
+    memset(s_glass_drops, 0, sizeof(s_glass_drops));
+    for (uint16_t i = 0; i < target && i < GLASS_DROP_MAX; ++i) {
+        respawn_glass_drop(&s_glass_drops[i]);
+    }
+    s_glass_drops_inited = true;
+}
+
+static void draw_glass_sun_glints(float t)
+{
+    if (!s_sun_visible || s_sun_strength <= 0.0f || is_night_kind(s_kind)) return;
+    if (s_sun_x < 0 || s_sun_y < 0) return;
+
+    ensure_glass_glints();
+    uint16_t cool = rgb565(214, 232, 255);
+    float sun_k = s_sun_strength;
+
+    /* Soft fixed sparkles on the pane — no orbiting streak/beam near the sun. */
+    for (int i = 0; i < GLASS_GLINT_MAX; ++i) {
+        const glass_glint_t *g = &s_glass_glints[i];
+        float tw = 0.30f + 0.70f * sinf(t * (1.15f + 0.07f * (float)i) + g->phase);
+        if (tw < 0.28f) continue;
+
+        int ix = (int)g->x;
+        int iy = (int)g->y;
+        uint8_t a = smooth_u8(tw, (uint8_t)(28.0f * sun_k * g->strength));
+        draw_filled_circle(ix, iy, 2, cool, a);
+    }
+}
+
+static void draw_glass_drop_bead(int x, int y, int r, uint16_t col_hi, uint8_t a)
+{
+    if (a < 4) return;
+    if (r < 1) r = 1;
+    draw_filled_circle(x, y, r, col_hi, a);
+    if (r > 2) {
+        draw_filled_circle(x - 1, y - 1, 1, col_hi, (uint8_t)(a * 4 / 5));
+    }
+}
+
+static void update_and_draw_glass_drops(float dt, float t)
+{
+    (void)t;
+    uint16_t target = glass_drop_target_for_kind(s_kind);
+    if (target == 0) return;
+
+    ensure_glass_drops();
+    uint16_t col_drop = rgb565(188, 210, 232);
+    uint16_t col_hi = rgb565(250, 252, 255);
+
+    for (uint16_t i = 0; i < target && i < GLASS_DROP_MAX; ++i) {
+        glass_drop_t *d = &s_glass_drops[i];
+
+        switch (d->state) {
+        case GLASS_DROP_FORMING:
+            d->timer -= dt;
+            if (d->form_total > 0.01f) {
+                float prog = 1.0f - (d->timer / d->form_total);
+                if (prog < 0.0f) prog = 0.0f;
+                if (prog > 1.0f) prog = 1.0f;
+                float start_r = d->target_r * 0.32f;
+                d->r = start_r + (d->target_r - start_r) * glass_ease_smooth(prog);
+            }
+            if (d->timer <= 0.0f) {
+                d->r = d->target_r;
+                d->v_term = glass_drop_v_term(d->r);
+                if (d->will_slide) {
+                    d->state = GLASS_DROP_SLIDING;
+                } else {
+                    glass_drop_begin_dry(d);
+                }
+            }
+            break;
+
+        case GLASS_DROP_SLIDING: {
+            /* Bead may swell slightly while sliding (collecting runoff). */
+            if (d->r < d->target_r) {
+                d->r += dt * 0.05f;
+                if (d->r > d->target_r) {
+                    d->r = d->target_r;
+                }
+            }
+            d->v_term = glass_drop_v_term(d->r);
+
+            /* Quadratic drag → slow start, ease into terminal speed. */
+            float speed_ratio = (d->v_term > 0.5f) ? (d->vy / d->v_term) : 0.0f;
+            float drag = speed_ratio * speed_ratio;
+            if (drag > 1.0f) {
+                drag = 1.0f;
+            }
+
+            /* Brief runaway near quota end: bigger beads overshoot v_term. */
+            float quota_used = (d->slide_quota > 1.0f) ? (d->dist_slid / d->slide_quota) : 0.0f;
+            float runaway = 0.0f;
+            if (quota_used > 0.78f && d->target_r > 2.6f) {
+                runaway = (quota_used - 0.78f) / 0.22f;
+                if (runaway > 1.0f) {
+                    runaway = 1.0f;
+                }
+            }
+
+            float accel = GLASS_SLIDE_GRAVITY * (1.0f - drag * (1.0f - runaway * 0.62f));
+            if (runaway > 0.0f) {
+                accel += GLASS_SLIDE_GRAVITY * 0.18f * runaway;
+            }
+            d->vy += accel * dt;
+
+            float v_cap = d->v_term * (1.0f + runaway * 0.34f);
+            if (d->vy > v_cap) {
+                d->vy = v_cap;
+            }
+
+            float wind_goal = -s_wind_vx_bias * 0.07f;
+            d->vx += (wind_goal - d->vx) * fminf(1.0f, dt * 1.8f);
+            d->x += d->vx * dt;
+            d->y += d->vy * dt;
+            d->dist_slid += d->vy * dt;
+
+            if (d->dist_slid >= d->slide_quota) {
+                glass_drop_begin_dry(d);
+            } else if (d->y > (float)EVA_WEATHER_RENDER_H + 18.0f ||
+                       d->x < -20.0f || d->x > (float)EVA_WEATHER_RENDER_W + 20.0f) {
+                respawn_glass_drop(d);
+                continue;
+            }
+            break;
+        }
+
+        case GLASS_DROP_DRYING:
+            d->timer -= dt;
+            if (d->fade_total > 0.01f) {
+                d->alpha = d->alpha_peak * (d->timer / d->fade_total);
+            } else {
+                d->alpha = 0.0f;
+            }
+            if (d->timer <= 0.0f || d->alpha < 0.04f) {
+                respawn_glass_drop(d);
+                continue;
+            }
+            break;
+        }
+
+        int x = (int)d->x;
+        int y = (int)d->y;
+        int r = (int)d->r;
+        uint8_t a = clamp_u8((int)(d->alpha * 200.0f));
+        if (a < 4) continue;
+
+        if (d->state == GLASS_DROP_SLIDING && d->vy > 1.0f) {
+            int trail = (int)(8.0f + d->vy * 0.11f);
+            if (trail < 8) trail = 8;
+            if (trail > 28) trail = 28;
+            float speed_k = (d->v_term > 1.0f) ? (d->vy / d->v_term) : 0.0f;
+            if (speed_k > 1.0f) {
+                speed_k = 1.0f;
+            }
+            uint8_t ta = (uint8_t)(a * (0.20f + 0.42f * speed_k));
+            if (ta < 6) ta = 6;
+            int tx = x - (int)(d->vx * 0.06f);
+            draw_rain_streak(tx, y - trail, x, y, col_drop, ta);
+        }
+
+        draw_glass_drop_bead(x, y, r, col_hi, a);
+    }
+}
+
+static void composite_glass_overlay(float dt, float t)
+{
+    draw_glass_sun_glints(t);
+    update_and_draw_glass_drops(dt, t);
 }
 
 static uint8_t background_hold_frames(weather_kind_t kind)
@@ -3090,27 +3755,15 @@ static uint8_t background_hold_frames(weather_kind_t kind)
     }
 }
 
-static uint8_t composite_hold_frames(weather_kind_t kind)
+static esp_err_t ppa_copy_rgb565(uint16_t *dst, const uint16_t *src)
 {
-    /* SHORT hold so cloud motion stays smooth. The composite caches the
-     * expensive sky+clouds+sunlight+godrays stack; reusing it for 3-4 frames
-     * amortises that cost (keeping ~25-30 FPS) while the clouds still update
-     * ~9-12×/sec — continuous to the eye. The previous 8-21 holds were what
-     * made the clouds visibly stutter (~2×/sec).
-     *
-     * Storm/rain get the shortest hold because their motion (fast clouds +
-     * particles) is the most motion-sensitive. */
-    switch (kind) {
-    case WEATHER_THUNDERSTORM:
-    case WEATHER_HEAVY_RAIN:
-    case WEATHER_RAIN:
-    case WEATHER_SLEET:
-    case WEATHER_HAIL:
-    case WEATHER_SNOW:
-        return 2;
-    default:
-        return 3;
+    if (!dst || !src) {
+        return ESP_ERR_INVALID_ARG;
     }
+    /* CPU memcpy — shares s_ppa_srm with non-blocking panel rotation; a second
+     * PPA SRM client here overflowed max_pending_trans_num=1 on boot. */
+    memcpy(dst, src, EVA_FRAME_BYTES);
+    return ESP_OK;
 }
 
 static void adapt_budget(int64_t frame_us)
@@ -3172,16 +3825,11 @@ void eva_weather_canvas_cloud_budget(uint16_t *active, uint16_t *max)
     if (max) *max = CLOUD_3D_MAX;
 }
 
-/* Cloud composition cache. Cloud blends are the most expensive single phase
- * (~12 ms on storm, ~10 ms otherwise) because each variant runs three PPA
- * passes (shadow + core + light) per layer × 3 layers × ≤2 bands. We cache
- * the result of the sky + sun + clouds + fog stack in s_bg_buf and reuse it
- * across `background_hold_frames(kind)` ticks. Particles and lightning are
- * drawn fresh on top every frame because those move every tick. */
 static void render_weather(float dt)
 {
     if (s_kind != s_prev_kind) {
         reset_particles_for_kind();
+        reset_glass_overlay_for_kind();
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
         s_prev_kind = s_kind;
@@ -3191,60 +3839,67 @@ static void render_weather(float dt)
     float t = (float)now_us / 1000000.0f;
     s_bg_dt += dt;
 
-    /* NO composite cache. The composite cache reused the whole scene for N
-     * frames, and however short the hold, the reused frames landed unevenly
-     * against the PPA-rotation/vsync timing — which read as the clouds
-     * "freezing once a second". Clouds now redraw EVERY frame for genuinely
-     * continuous motion.
-     *
-     * To afford that, the per-frame work was cut down hard:
-     *   - background (sky gradient + sun disc/glow + halo + fog) is cached in
-     *     s_bg_buf and only re-rendered every background_hold_frames ticks
-     *     (it changes over minutes). The god-ray halo lives here too.
-     *   - the heavy sun-cloud rim lighting was removed.
-     *   - the cloud morph re-bake spike was removed.
-     *   - sun glow circles were capped at Fibonacci 89 px.
-     * What stays per-frame: one bg memcpy, one cloud PPA blend, particles,
-     * lightning. */
     int64_t tb0 = esp_timer_get_time();
+    bool sky_refreshed = false;
     if (!s_bg_buf || s_bg_ttl == 0) {
         sky_t sky = sky_for_kind(s_kind);
         fill_gradient(sky.top, sky.bottom);
         draw_day_sky_depth();
         draw_sun_or_moon(t);
-        draw_sun_sky_glare();
-        draw_sun_god_rays(t);          /* halo baked into the cached bg */
         if (s_bg_buf) {
-            memcpy(s_bg_buf, s_buf,
-                   EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
+            (void)ppa_copy_rgb565(s_bg_buf, s_buf);
         }
         s_bg_dt = 0.0f;
         s_bg_ttl = background_hold_frames(s_kind);
+        sky_refreshed = true;
     } else {
-        memcpy(s_buf, s_bg_buf,
-               EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t));
         s_bg_ttl--;
     }
     int64_t tb_after_bg = esp_timer_get_time();
     s_prof_bg_us += (tb_after_bg - tb0);
 
-    /* Clouds + text fresh every frame — smooth, wind-driven motion. */
-    draw_scene_text_overlays();
-    int64_t tb_after_text = esp_timer_get_time();
-    compose_clouds_into_working_buffer(dt);
+    /* Z-order (bottom → top): sky+sun → outdoor rain/lightning → text →
+     * clouds → glass. s_bg_buf holds sky+sun only; copy it into s_buf then
+     * paint the pane stack before PPA cloud composite (text occluded). */
+    if (s_bg_buf && !sky_refreshed) {
+        (void)ppa_copy_rgb565(s_buf, s_bg_buf);
+    }
 
-    int64_t tb_after_clouds = esp_timer_get_time();
-    s_prof_clouds_us += (tb_after_clouds - tb_after_bg);
+    draw_sun_fib_light(t);
 
-    (void)tb_after_text;
+    int64_t tb_overlay0 = esp_timer_get_time();
     update_and_draw_particles(dt, t);
     int64_t tb3 = esp_timer_get_time();
-    s_prof_particles_us += (tb3 - tb_after_clouds);
+    s_prof_particles_us += (tb3 - tb_overlay0);
 
     update_lightning(t);
     composite_lightning_on_render();
     int64_t tb4 = esp_timer_get_time();
     s_prof_lightning_us += (tb4 - tb3);
+
+    int64_t tb_text0 = esp_timer_get_time();
+    draw_scene_text_overlays();
+    int64_t tb_after_text = esp_timer_get_time();
+    s_prof_text_us += (tb_after_text - tb_text0);
+
+    advance_cloud_frame(dt);
+    int64_t tb_cloud0 = esp_timer_get_time();
+    {
+        /* s_blend_from_sky stays false: clouds blend over s_buf (sky+rain+
+         * lightning+text), not the sky-only cache. Wrap bands use s_buf too. */
+        bool sky_wrap = false;
+        if (blend_layer(&s_strip[CLOUD_LAYER_HIGH], sky_wrap)) sky_wrap = false;
+        if (blend_layer(&s_strip[CLOUD_LAYER_MID], sky_wrap)) sky_wrap = false;
+        (void)blend_layer(&s_strip[CLOUD_LAYER_LOW], sky_wrap);
+    }
+    s_blend_from_sky = false;
+    int64_t tb_after_clouds = esp_timer_get_time();
+    s_prof_clouds_us += (tb_after_clouds - tb_cloud0);
+
+    int64_t tb_glass0 = esp_timer_get_time();
+    composite_glass_overlay(dt, t);
+    int64_t tb_glass1 = esp_timer_get_time();
+    s_prof_glass_us += (tb_glass1 - tb_glass0);
 }
 
 /* upscale removed: render is native 800×480 directly into s_display_buf. */
@@ -3334,16 +3989,22 @@ static void native_render_task(void *arg)
         s_last_us = now;
         if (tick_us < tick_min) tick_min = tick_us;
         if (tick_us > tick_max) tick_max = tick_us;
-        s_buf = s_render_buf;
-
         int64_t t0 = esp_timer_get_time();
+        if (s_render_lock) {
+            xSemaphoreTake(s_render_lock, portMAX_DELAY);
+        }
+        s_buf = s_render_buf;
         render_weather(dt);
+        if (s_render_lock) {
+            xSemaphoreGive(s_render_lock);
+        }
         int64_t t_render = esp_timer_get_time();
 
         esp_err_t err = rotate_render_to_dpi_fb(s_dpi_back_fb);
         if (err == ESP_OK) {
             if (xSemaphoreTake(s_ppa_done_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
                 ESP_LOGW(TAG, "PPA rotate timeout");
+                vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
                 continue;
             }
         } else {
@@ -3381,17 +4042,19 @@ static void native_render_task(void *arg)
             uint32_t tick_avg = (uint32_t)(s_accum_tick_us / s_frames);
             uint32_t tick_hz = tick_avg ? (uint32_t)(1000000ULL / tick_avg) : 0;
             uint32_t bg_avg     = (uint32_t)(s_prof_bg_us        / s_frames);
+            uint32_t tx_avg     = (uint32_t)(s_prof_text_us      / s_frames);
             uint32_t cl_avg     = (uint32_t)(s_prof_clouds_us    / s_frames);
             uint32_t pa_avg     = (uint32_t)(s_prof_particles_us / s_frames);
             uint32_t li_avg     = (uint32_t)(s_prof_lightning_us / s_frames);
+            uint32_t gl_avg     = (uint32_t)(s_prof_glass_us      / s_frames);
             uint32_t rot_avg    = (uint32_t)(prof_rotate_us      / s_frames);
             uint32_t vsync_avg  = (uint32_t)(s_accum_lvgl_slot_us / s_frames);
-            ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u cl=%u pa=%u li=%u ppa_rot=%u lvgl=0 vsync=%u) jitter=%u..%u",
+            ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u tx=%u cl=%u pa=%u li=%u gl=%u ppa_rot=%u lvgl=0 vsync=%u) jitter=%u..%u",
                      weather_kind_name(s_kind), (unsigned)tick_hz,
                      (unsigned)s_target, (unsigned)s_max_target,
                      (unsigned)s_clouds3d_active, (unsigned)CLOUD_3D_MAX,
                      (unsigned)avg,
-                     bg_avg, cl_avg, pa_avg, li_avg, rot_avg, vsync_avg,
+                     bg_avg, tx_avg, cl_avg, pa_avg, li_avg, gl_avg, rot_avg, vsync_avg,
                      (unsigned)tick_min, (unsigned)tick_max);
             tick_min = 1000000; tick_max = 0;
             s_last_tick_hz = tick_hz;
@@ -3407,9 +4070,11 @@ static void native_render_task(void *arg)
             s_accum_tick_us = 0;
             s_accum_lvgl_slot_us = 0;
             s_prof_bg_us = 0;
+            s_prof_text_us = 0;
             s_prof_clouds_us = 0;
             s_prof_particles_us = 0;
             s_prof_lightning_us = 0;
+            s_prof_glass_us = 0;
             prof_rotate_us = 0;
         }
 
@@ -3453,18 +4118,20 @@ static void canvas_tick(lv_timer_t *timer)
         uint32_t tick_avg = (uint32_t)(s_accum_tick_us / s_frames);
         uint32_t tick_hz = tick_avg ? (uint32_t)(1000000ULL / tick_avg) : 0;
         uint32_t bg_avg     = (uint32_t)(s_prof_bg_us       / s_frames);
+        uint32_t tx_avg     = (uint32_t)(s_prof_text_us     / s_frames);
         uint32_t cl_avg     = (uint32_t)(s_prof_clouds_us   / s_frames);
         uint32_t pa_avg     = (uint32_t)(s_prof_particles_us/ s_frames);
         uint32_t li_avg     = (uint32_t)(s_prof_lightning_us/ s_frames);
+        uint32_t gl_avg     = (uint32_t)(s_prof_glass_us     / s_frames);
         uint32_t lvgl_avg   = (uint32_t)(s_accum_lvgl_slot_us / s_frames);
         uint32_t vsync_avg  = 0;
         uint32_t up_avg     = (uint32_t)(prof_upscale_us    / s_frames);
-        ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u cl=%u pa=%u li=%u up=%u lvgl=%u vsync=%u)",
+        ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u tx=%u cl=%u pa=%u li=%u gl=%u up=%u lvgl=%u vsync=%u)",
                  weather_kind_name(s_kind), (unsigned)tick_hz,
                  (unsigned)s_target, (unsigned)s_max_target,
                  (unsigned)s_clouds3d_active, (unsigned)CLOUD_3D_MAX,
                  (unsigned)avg,
-                 bg_avg, cl_avg, pa_avg, li_avg, up_avg, lvgl_avg, vsync_avg);
+                 bg_avg, tx_avg, cl_avg, pa_avg, li_avg, gl_avg, up_avg, lvgl_avg, vsync_avg);
         s_last_tick_hz = tick_hz;
         s_last_work_us = avg;
         s_last_bg_us = bg_avg;
@@ -3478,9 +4145,11 @@ static void canvas_tick(lv_timer_t *timer)
         s_accum_tick_us = 0;
         s_accum_lvgl_slot_us = 0;
         s_prof_bg_us = 0;
+        s_prof_text_us = 0;
         s_prof_clouds_us = 0;
         s_prof_particles_us = 0;
         s_prof_lightning_us = 0;
+        s_prof_glass_us = 0;
         prof_upscale_us = 0;
     }
 
@@ -3492,10 +4161,7 @@ lv_obj_t *eva_weather_canvas_init(lv_obj_t *parent)
     if (s_canvas) return s_canvas;
 
     s_rng ^= (uint32_t)esp_timer_get_time();
-    /* 128-byte alignment required by PPA on ESP32-P4 (L2 cache line = 128 B).
-     * heap_caps_aligned_alloc(64,...) is not enough — half the time the address
-     * lands at 64-mod-128 and PPA rejects it as "not aligned to cache line size". */
-    s_render_buf = heap_caps_aligned_alloc(128,
+    s_render_buf = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
                                            EVA_WEATHER_CANVAS_W * EVA_WEATHER_CANVAS_H * sizeof(uint16_t),
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_render_buf) {
@@ -3504,28 +4170,24 @@ lv_obj_t *eva_weather_canvas_init(lv_obj_t *parent)
     }
     s_display_buf = s_render_buf;
     s_buf = s_render_buf;
-    s_bg_buf = heap_caps_aligned_alloc(128,
+    if (!s_render_lock) {
+        s_render_lock = xSemaphoreCreateMutex();
+        if (!s_render_lock) {
+            ESP_LOGE(TAG, "render lock alloc failed");
+            abort();
+        }
+    }
+    s_bg_buf = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
                                        EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_bg_buf) {
         ESP_LOGE(TAG, "background buffer alloc failed");
         abort();
     }
-    s_composite_buf = heap_caps_aligned_alloc(128,
-                                              EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
+    /* Scene text A8 cache (clock + date + temp + desc). Lifetime = process. */
+    s_scene_slot.a8 = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, TEXT_SLOT_BUF_BYTES,
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_composite_buf) {
-        ESP_LOGE(TAG, "composite buffer alloc failed");
-        abort();
-    }
-    /* Text-overlay A8 caches (clock/temp/desc). Lifetime = process. */
-    s_clock_slot.a8 = heap_caps_malloc(TEXT_SLOT_BUF_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_temp_slot.a8  = heap_caps_malloc(TEXT_SLOT_BUF_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_desc_slot.a8  = heap_caps_malloc(TEXT_SLOT_BUF_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_clock_slot.a8 || !s_temp_slot.a8 || !s_desc_slot.a8) {
+    if (!s_scene_slot.a8) {
         ESP_LOGE(TAG, "text slot alloc failed");
         abort();
     }
@@ -3602,7 +4264,7 @@ void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel)
     ESP_ERROR_CHECK(s_panel ? ESP_OK : ESP_ERR_INVALID_ARG);
 
     s_rng ^= (uint32_t)esp_timer_get_time();
-    s_render_buf = heap_caps_aligned_alloc(128,
+    s_render_buf = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
                                            EVA_WEATHER_CANVAS_W * EVA_WEATHER_CANVAS_H * sizeof(uint16_t),
                                            MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_render_buf) {
@@ -3611,27 +4273,23 @@ void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel)
     }
     s_display_buf = s_render_buf;
     s_buf = s_render_buf;
-    s_bg_buf = heap_caps_aligned_alloc(128,
+    if (!s_render_lock) {
+        s_render_lock = xSemaphoreCreateMutex();
+        if (!s_render_lock) {
+            ESP_LOGE(TAG, "render lock alloc failed");
+            abort();
+        }
+    }
+    s_bg_buf = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
                                        EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_bg_buf) {
         ESP_LOGE(TAG, "background buffer alloc failed");
         abort();
     }
-    s_composite_buf = heap_caps_aligned_alloc(128,
-                                              EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
+    s_scene_slot.a8 = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, TEXT_SLOT_BUF_BYTES,
                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_composite_buf) {
-        ESP_LOGE(TAG, "composite buffer alloc failed");
-        abort();
-    }
-    s_clock_slot.a8 = heap_caps_malloc(TEXT_SLOT_BUF_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_temp_slot.a8  = heap_caps_malloc(TEXT_SLOT_BUF_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    s_desc_slot.a8  = heap_caps_malloc(TEXT_SLOT_BUF_BYTES,
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_clock_slot.a8 || !s_temp_slot.a8 || !s_desc_slot.a8) {
+    if (!s_scene_slot.a8) {
         ESP_LOGE(TAG, "text slot alloc failed");
         abort();
     }
@@ -3762,8 +4420,6 @@ void eva_weather_canvas_set_kind(weather_kind_t kind)
         s_under_budget = 0;
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
-        s_composite_ttl = 0;
-        s_composite_dt = 0.0f;
     }
 }
 
@@ -3774,6 +4430,27 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
     if (kind <= WEATHER_UNKNOWN || kind >= WEATHER_KIND_COUNT) {
         kind = WEATHER_CLOUDY;
     }
+    s_precip_type = st->precip_type;
+
+    /* Nudge visual kind when WMO label and measured cloud cover disagree. */
+    {
+        int sr = (st->sunrise_min >= 0 && st->sunrise_min < 24 * 60) ? st->sunrise_min : 360;
+        int ss = (st->sunset_min  >= 0 && st->sunset_min  < 24 * 60) ? st->sunset_min  : 1080;
+        int m = minutes_now();
+        bool clock_night = (m < sr || m >= ss);
+        uint8_t cover = st->cloud_cover_pct;
+
+        if (kind == WEATHER_PARTLY_CLOUDY_DAY || kind == WEATHER_PARTLY_CLOUDY_NIGHT) {
+            if (cover >= 92) {
+                kind = WEATHER_CLOUDY;
+            }
+        } else if (kind == WEATHER_CLOUDY && cover < 48) {
+            kind = clock_night ? WEATHER_PARTLY_CLOUDY_NIGHT : WEATHER_PARTLY_CLOUDY_DAY;
+        } else if ((kind == WEATHER_CLEAR_DAY || kind == WEATHER_CLEAR_NIGHT) && cover >= 72) {
+            kind = clock_night ? WEATHER_PARTLY_CLOUDY_NIGHT : WEATHER_PARTLY_CLOUDY_DAY;
+        }
+    }
+
     float density = density_scale_from_weather(st);
     s_sunrise_min  = st->sunrise_min;
     s_sunset_min   = st->sunset_min;
@@ -3839,6 +4516,7 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
 
     if (kind_changed) {
         s_prev_kind = WEATHER_UNKNOWN;
+        s_scene_slot.valid = false;
         s_clouds3d_inited = false;
         s_frames = 0;
         s_accum_us = 0;
@@ -3847,8 +4525,6 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
         s_under_budget = 0;
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
-        s_composite_ttl = 0;
-        s_composite_dt = 0.0f;
         /* Note: s_clouds3d_active is already set above by cloud_cover_pct adaptation;
          * don't reset it here to preserve the adapted count. */
     }
@@ -3883,6 +4559,14 @@ void eva_weather_canvas_set_clock_text(const char *text)
     if (!text) return;
     portENTER_CRITICAL(&s_text_mux);
     strlcpy(s_clock_text, text, sizeof(s_clock_text));
+    portEXIT_CRITICAL(&s_text_mux);
+}
+
+void eva_weather_canvas_set_date_text(const char *text)
+{
+    if (!text) return;
+    portENTER_CRITICAL(&s_text_mux);
+    strlcpy(s_date_text, text, sizeof(s_date_text));
     portEXIT_CRITICAL(&s_text_mux);
 }
 
@@ -3925,7 +4609,6 @@ void eva_weather_canvas_set_test_cloud_pct(int high, int mid, int low)
         s_cloud_pct[CLOUD_LAYER_LOW]  = (uint8_t)s_test_cloud_pct_override[CLOUD_LAYER_LOW];
     /* Force tint refresh on next compose (re-derives alpha_scale from pct). */
     s_bg_ttl = 0;
-    s_composite_ttl = 0;
     portEXIT_CRITICAL(&s_frame_mux);
 }
 

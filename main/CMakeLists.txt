@@ -3,6 +3,7 @@ idf_component_register(
          eva_wifi.c eva_weather.c eva_weather_canvas.c
          eva_font_uk_22.c eva_font_uk_14.c eva_font_clock_144.c
          eva_font_clock_144_extralight.c eva_font_clock_144_extrabold.c
+         eva_font_clock_288_extralight.c
          eva_screenshot.c
          weather_fetch.c weather_fetch_clearoutside.c weather_fetch_openmeteo.c
     INCLUDE_DIRS .

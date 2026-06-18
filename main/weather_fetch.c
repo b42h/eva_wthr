@@ -1,5 +1,8 @@
 /* main/weather_fetch.c
  *
+ * Dual-source weather coordinator. Spec:
+ * docs/superpowers/specs/2026-05-25-dual-source-weather-design.md
+ *
  * Owns two FreeRTOS timers. On fire, dispatches the relevant provider on a
  * worker task (HTTP must not run from timer context). On success, merges
  * the partial state into the canonical weather_state_t and applies it via

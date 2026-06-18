@@ -12,10 +12,9 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
-#include "sdkconfig.h"
 
-#define WIFI_SSID       CONFIG_EVA_WIFI_SSID
-#define WIFI_PASSWORD   CONFIG_EVA_WIFI_PASSWORD
+#define WIFI_SSID       "getRicher"
+#define WIFI_PASSWORD   "sure0420"
 #define WIFI_START_DELAY_MS  10000
 #define WIFI_MAX_RETRY  10
 
