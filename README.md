@@ -68,6 +68,11 @@ The first public commit (`65c2e5f`) already had the working P4+C6 weather stack.
 | Glass glints | — | Soft fixed sparkles on the pane (no rotating lens-flare beam) |
 | Layer order | Simpler stack | Explicit z-order: sky → halo → outdoor FX → text → clouds → glass |
 | Moon | Smaller disc | **2×** radius to match the larger sun |
+| Sky gradient | Flat horizontal bands | **Radial**, warm light pooled around the sun's azimuth |
+| Dusk | Snapped to night at sunset | **Smooth** twilight→night ramp over the civil-twilight window |
+| Sun/moon set | Popped off at the horizon | **Sinks below** the bottom edge and rises back at dawn |
+| Backlight | Fixed `[01:00, 06:00)` dim | **Sun-driven ramp** 100 %↔10 % around real sunset/sunrise |
+| Wi-Fi recovery | Gave up after N retries | **Indefinite** reconnect with exponential backoff |
 
 Removed for stability/FPS: full-screen sky glare scan and heavy static god-ray passes (they caused visible hitches on clear days).
 
@@ -143,23 +148,26 @@ Eva Weather
 
 Set:
 
-| Option | Meaning |
-| --- | --- |
-| `CONFIG_EVA_WIFI_SSID` | Your Wi-Fi network name. |
-| `CONFIG_EVA_WIFI_PASSWORD` | Your Wi-Fi password. Do not commit your real value. |
-| `CONFIG_EVA_WEATHER_LATITUDE` | Latitude for Open-Meteo and Clear Outside. |
-| `CONFIG_EVA_WEATHER_LONGITUDE` | Longitude for Open-Meteo and Clear Outside. |
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `CONFIG_EVA_WIFI_SSID` | `YOUR_WIFI_SSID` | Your Wi-Fi network name (2.4 GHz). |
+| `CONFIG_EVA_WIFI_PASSWORD` | `YOUR_WIFI_PASSWORD` | Your Wi-Fi password. |
+| `CONFIG_EVA_WEATHER_LATITUDE` | `50.447914` | Latitude for Open-Meteo and Clear Outside. |
+| `CONFIG_EVA_WEATHER_LONGITUDE` | `30.522192` | Longitude for Open-Meteo and Clear Outside. |
 
-You can also edit these defaults in `sdkconfig.defaults` before the first build:
+The Wi-Fi defaults are placeholders, so the shipped firmware will not connect
+until you set your own. Edit them in `menuconfig` (above), or pin them for
+reproducible builds by **adding** these lines to `sdkconfig.defaults` before the
+first build (they are not there by default):
 
 ```text
-CONFIG_EVA_WIFI_SSID="YOUR_WIFI_SSID"
-CONFIG_EVA_WIFI_PASSWORD="YOUR_WIFI_PASSWORD"
+CONFIG_EVA_WIFI_SSID="your-network"
+CONFIG_EVA_WIFI_PASSWORD="your-password"
 CONFIG_EVA_WEATHER_LATITUDE="50.447914"
 CONFIG_EVA_WEATHER_LONGITUDE="30.522192"
 ```
 
-Those defaults point to Khreshchatyk Street in central Kyiv.
+The coordinate defaults point to central Kyiv.
 
 The default timezone is stored in `main/eva_settings.c`:
 
