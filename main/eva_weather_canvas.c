@@ -63,6 +63,7 @@
 #define CLOUD_LAYER_MID  1
 #define CLOUD_LAYER_LOW  2
 #define CLOUD_LAYER_COUNT 3
+#define CLOUD_STRIP_OVERFLOW_Y FIB_144   /* clouds bleed this far above/below 480px */
 #define CLOUD_VARIANT_COUNT 2
 
 #define GLASS_GLINT_MAX  FIB_8
@@ -244,26 +245,27 @@ static cloud_strip_t s_strip[CLOUD_LAYER_COUNT] = {
      * MID altocumulus drifts visibly, LOW cumulus is the parallax foreground.
      * Final speed = base * wind_factor(kph) and the LOW layer takes a larger
      * multiplier under heavy wind (cumulus catches gusts more than cirrus). */
-    /* All three layers span the WHOLE sky (y = -40..520, bleeding off both
-     * edges) instead of sitting in separate horizontal bands. This removes
-     * the "stripe" look and the gaps between bands — any cloud type can sit
-     * anywhere vertically, like a real sky. Depth comes from three cues, not
-     * from vertical position:
-     *   - size:  HIGH = small distant cirrus, LOW = big near cumulus (bake)
-     *   - speed: HIGH drifts slowest, LOW fastest (parallax, base_speed)
-     *   - order: drawn HIGH→MID→LOW so nearer clouds overlap farther ones
-     * Off-screen parts (y<0 or y>480) are clipped per-band in the blend. */
+    /* Full-sky immersion: strips extend well above and below the 480px frame so
+     * cloud mass continues past the rim — viewer feels inside the layer, not
+     * below a ceiling. PPA blend clips to the viewport; overflow rows stay in
+     * the mask for scroll/bob and soft parallax at the edges. */
     [CLOUD_LAYER_HIGH] = {
-        .y_start = -40, .strip_h = 560, .base_speed = (float)FIB_2,
-        .morph_hold_s = (float)FIB_89, .morph_duration_s = (float)FIB_13,
+        .y_start = -CLOUD_STRIP_OVERFLOW_Y,
+        .strip_h = EVA_WEATHER_RENDER_H + 2 * CLOUD_STRIP_OVERFLOW_Y,
+        .base_speed = (float)FIB_5,
+        .morph_hold_s = (float)FIB_55, .morph_duration_s = (float)FIB_8,
     },
     [CLOUD_LAYER_MID] = {
-        .y_start = -40, .strip_h = 560, .base_speed = (float)FIB_5,
-        .morph_hold_s = (float)FIB_55, .morph_duration_s = (float)FIB_13,
+        .y_start = -CLOUD_STRIP_OVERFLOW_Y,
+        .strip_h = EVA_WEATHER_RENDER_H + 2 * CLOUD_STRIP_OVERFLOW_Y,
+        .base_speed = (float)FIB_13,
+        .morph_hold_s = (float)FIB_34, .morph_duration_s = (float)FIB_8,
     },
     [CLOUD_LAYER_LOW] = {
-        .y_start = -40, .strip_h = 560, .base_speed = (float)FIB_13,
-        .morph_hold_s = (float)FIB_34, .morph_duration_s = (float)FIB_21,
+        .y_start = -CLOUD_STRIP_OVERFLOW_Y,
+        .strip_h = EVA_WEATHER_RENDER_H + 2 * CLOUD_STRIP_OVERFLOW_Y,
+        .base_speed = (float)FIB_21,
+        .morph_hold_s = (float)FIB_21, .morph_duration_s = (float)FIB_13,
     },
 };
 /* Sun position cache — populated by draw_sun_or_moon() in the bg-cache pass,
@@ -313,9 +315,19 @@ static float s_lightning_next_strike_at;
 static bool s_lightning_active;
 static bool s_lightning_sheet_only;
 static bool s_lightning_has_branch;
-static uint8_t s_lightning_pulse_idx;
-static uint8_t s_lightning_pulse_frame;
-#define LIGHTNING_PT_MAX     FIB_13
+static float s_lightning_channel_alpha;
+static float s_lightning_flash_alpha;
+static float s_lightning_strike_age;
+static float s_lightning_afterglow;
+static float s_lightning_fade_start;
+static float s_lightning_fade_dur;
+static bool s_lightning_in_fade;
+static uint8_t s_lightning_stroke_total;
+static uint8_t s_lightning_stroke_next;
+#define LIGHTNING_STROKE_MAX 6
+static float s_lightning_stroke_t[LIGHTNING_STROKE_MAX];
+static float s_lightning_stroke_k[LIGHTNING_STROKE_MAX];
+#define LIGHTNING_PT_MAX     FIB_21
 #define LIGHTNING_BRANCH_MAX FIB_5
 static int s_lightning_pt_count;
 static int s_lightning_branch_pts;
@@ -323,6 +335,8 @@ static int16_t s_lightning_x[LIGHTNING_PT_MAX];
 static int16_t s_lightning_y[LIGHTNING_PT_MAX];
 static int16_t s_lightning_bx[LIGHTNING_BRANCH_MAX];
 static int16_t s_lightning_by[LIGHTNING_BRANCH_MAX];
+static int16_t s_lightning_flash_x;
+static int16_t s_lightning_flash_y;
 static uint8_t s_bg_ttl;
 static float s_bg_dt;
 static bool s_visible;
@@ -1759,6 +1773,38 @@ static uint8_t scaled_peak(int base, float lo, float hi)
     return clamp_u8(v);
 }
 
+static void feather_strip_edges(uint8_t *a8, int w, int h, int fade_px)
+{
+    if (fade_px <= 0 || h < 2 * fade_px) return;
+    for (int y = 0; y < fade_px; ++y) {
+        float t = (float)y / (float)fade_px;
+        float k = t * t * (3.0f - 2.0f * t);
+        int k_q = (int)(k * 256.0f);
+        uint8_t *row_top = &a8[y * w];
+        uint8_t *row_bot = &a8[(h - 1 - y) * w];
+        for (int x = 0; x < w; ++x) {
+            row_top[x] = (uint8_t)((row_top[x] * k_q) >> 8);
+            row_bot[x] = (uint8_t)((row_bot[x] * k_q) >> 8);
+        }
+    }
+}
+
+/* Random micro-puffs — breaks up the too-uniform look on the taller strip. */
+static void bake_cloud_scatter(uint8_t *a8_light, uint8_t *a8_shadow, uint8_t *a8_core,
+                               int w, int h, int count,
+                               uint8_t peak_base, float peak_lo, float peak_hi)
+{
+    for (int i = 0; i < count; ++i) {
+        blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
+                             rndf(0.0f, (float)w),
+                             rndf((float)h * 0.03f, (float)h * 0.97f),
+                             rndf((float)FIB_8, (float)FIB_34),
+                             rndf((float)FIB_3, (float)FIB_13 + 4.0f),
+                             scaled_peak(peak_base, peak_lo, peak_hi),
+                             rndf(-0.75f, 0.55f), rndf(0.04f, 0.35f));
+    }
+}
+
 static void bake_strip_high(uint8_t *a8_light, uint8_t *a8_shadow,
                             uint8_t *a8_core, int w, int h)
 {
@@ -1771,15 +1817,41 @@ static void bake_strip_high(uint8_t *a8_light, uint8_t *a8_shadow,
     /* Cirrus peak alpha = FIB_144 (translucent veils). Light bias -0.4 keeps
      * the streaks mostly in the light mask since they're thin enough that
      * there's no real underside shadow in reality. */
-    for (int i = 0; i < FIB_5; ++i) {                /* 5 thin veils */
+    for (int i = 0; i < FIB_8; ++i) {
         blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
                              rndf(0.0f, (float)w),
-                             rndf((float)h * 0.26f, (float)h * 0.62f),
+                             rndf((float)h * 0.04f, (float)h * 0.96f),
+                             rndf((float)FIB_55, (float)FIB_144),
+                             rndf((float)FIB_2, (float)FIB_13),
+                             scaled_peak(FIB_89, 0.50f, 0.95f),
+                             rndf(-0.65f, 0.15f), rndf(0.06f, 0.22f));
+    }
+    for (int i = 0; i < FIB_5; ++i) {
+        blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
+                             rndf(0.0f, (float)w),
+                             rndf((float)h * 0.18f, (float)h * 0.78f),
                              rndf((float)FIB_89, (float)FIB_144),
-                             rndf((float)FIB_2, (float)FIB_5),
-                             scaled_peak(FIB_89, 0.45f, 0.80f),
+                             rndf((float)FIB_2, (float)FIB_8),
+                             scaled_peak(FIB_89, 0.45f, 0.85f),
                              -0.55f, 0.10f);
     }
+    for (int i = 0; i < FIB_5; ++i) {
+        blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
+                             rndf(0.0f, (float)w),
+                             rndf((float)h * 0.02f, (float)h * 0.22f),
+                             rndf((float)FIB_55, (float)FIB_89),
+                             rndf((float)FIB_5, (float)FIB_13),
+                             scaled_peak(FIB_89, 0.55f, 0.95f),
+                             -0.45f, 0.12f);
+        blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
+                             rndf(0.0f, (float)w),
+                             rndf((float)h * 0.78f, (float)h * 0.98f),
+                             rndf((float)FIB_55, (float)FIB_89),
+                             rndf((float)FIB_5, (float)FIB_13),
+                             scaled_peak(FIB_89, 0.55f, 0.95f),
+                             -0.45f, 0.12f);
+    }
+    bake_cloud_scatter(a8_light, a8_shadow, a8_core, w, h, FIB_13, FIB_55, 0.35f, 0.75f);
 }
 
 static void bake_strip_mid(uint8_t *a8_light, uint8_t *a8_shadow,
@@ -1788,35 +1860,39 @@ static void bake_strip_mid(uint8_t *a8_light, uint8_t *a8_shadow,
     memset(a8_light, 0, w * h);
     memset(a8_shadow, 0, w * h);
     memset(a8_core, 0, w * h);
-    /* Mid layer: small broken fair-weather cumulus, not a continuous band. */
-    for (int i = 0; i < FIB_8; ++i) {
+    /* Mid layer: broken cumulus — denser anchors + random satellites. */
+    for (int i = 0; i < FIB_8 + FIB_3; ++i) {
         float cx = rndf(0.0f, (float)w);
-        float cy = rndf((float)h * 0.34f, (float)h * 0.72f);
-        float base_rx = rndf((float)FIB_34, (float)FIB_55 + 12.0f);
+        float cy = rndf((float)h * 0.05f, (float)h * 0.92f);
+        float base_rx = rndf((float)FIB_34, (float)FIB_55 + rndf(0.0f, 18.0f));
+        float mass = rndf(0.82f, 1.22f);
         blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
-                             cx, cy + rndf(5.0f, 14.0f),
-                             base_rx, rndf((float)FIB_8 + 5.0f, (float)FIB_13 + 7.0f),
-                             scaled_peak(FIB_144 + FIB_34, 0.66f, 1.02f),
-                             0.65f, 0.85f);
-        for (int j = 0; j < FIB_3 + FIB_1; ++j) {
-            blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
-                                 cx + rndf(-base_rx * 0.65f, base_rx * 0.65f),
-                                 cy + rndf(-(float)FIB_21, (float)FIB_8),
-                                 rndf((float)FIB_13 + 7.0f, (float)FIB_34),
-                                 rndf((float)FIB_8 + 4.0f, (float)FIB_21),
-                                 scaled_peak(FIB_233 - FIB_21, 0.72f, 1.08f),
-                                 -0.45f, 0.38f);
-        }
-        for (int j = 0; j < FIB_3; ++j) {
+                             cx, cy + rndf(-8.0f, 18.0f),
+                             base_rx * mass, rndf((float)FIB_8, (float)FIB_21) * mass,
+                             scaled_peak(FIB_144 + FIB_34, 0.66f, 1.08f),
+                             rndf(0.35f, 0.85f), rndf(0.55f, 0.95f));
+        int sub_lo = (int)rndf(2.0f, (float)(FIB_3 + FIB_1));
+        int sub_hi = (int)rndf((float)(FIB_5 + FIB_1), (float)(FIB_8 + FIB_1));
+        for (int j = 0; j < sub_lo + (i & 1); ++j) {
             blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
                                  cx + rndf(-base_rx * 0.75f, base_rx * 0.75f),
-                                 cy + rndf(-(float)FIB_34, -(float)FIB_8),
+                                 cy + rndf(-(float)FIB_34, (float)FIB_13),
+                                 rndf((float)FIB_13, (float)FIB_34 + 10.0f) * mass,
+                                 rndf((float)FIB_8, (float)FIB_21) * mass,
+                                 scaled_peak(FIB_233 - FIB_21, 0.72f, 1.12f),
+                                 rndf(-0.65f, 0.25f), rndf(0.22f, 0.48f));
+        }
+        for (int j = 0; j < sub_hi - sub_lo; ++j) {
+            blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h,
+                                 cx + rndf(-base_rx * 0.85f, base_rx * 0.85f),
+                                 cy + rndf(-(float)FIB_55, (float)FIB_8),
+                                 rndf((float)FIB_5, (float)FIB_13 + 4.0f),
                                  rndf((float)FIB_5, (float)FIB_13 + 2.0f),
-                                 rndf((float)FIB_5, (float)FIB_13),
-                                 scaled_peak(FIB_89, 0.35f, 0.70f),
-                                 -0.7f, 0.10f);
+                                 scaled_peak(FIB_89, 0.30f, 0.78f),
+                                 rndf(-0.85f, -0.35f), rndf(0.04f, 0.18f));
         }
     }
+    bake_cloud_scatter(a8_light, a8_shadow, a8_core, w, h, FIB_21, FIB_89, 0.40f, 0.85f);
 }
 
 static void bake_strip_low(uint8_t *a8_light, uint8_t *a8_shadow,
@@ -1828,11 +1904,11 @@ static void bake_strip_low(uint8_t *a8_light, uint8_t *a8_shadow,
     /* Low layer: larger cumulus masses with dark bellies and torn bright
      * tops. These are the shapes that should echo the user's real reference
      * photo: strong volume, broken edge, many different scales. */
-    for (int i = 0; i < FIB_5; ++i) {
+    for (int i = 0; i < FIB_5 + FIB_3; ++i) {
         float cx = rndf(0.0f, (float)w);
-        float cy = rndf((float)h * 0.42f, (float)h * 0.82f);
-        float mass = rndf(0.72f, 1.18f);
-        float base_rx = rndf((float)FIB_34 + 8.0f, (float)FIB_89) * mass;
+        float cy = rndf((float)h * 0.06f, (float)h * 0.94f);
+        float mass = rndf(0.68f, 1.28f);
+        float base_rx = rndf((float)FIB_34 + 8.0f, (float)FIB_89 + rndf(0.0f, 16.0f)) * mass;
         blob_gaussian_triple(a8_light, a8_shadow, a8_core, w, h, cx, cy,
                              base_rx,
                              rndf((float)FIB_13 + 6.0f, (float)FIB_21 + 10.0f) * mass,
@@ -1865,26 +1941,7 @@ static void bake_strip_low(uint8_t *a8_light, uint8_t *a8_shadow,
                                  -0.85f, 0.06f);
         }
     }
-}
-
-/* Multiply the top and bottom edges of an A8 strip by a smoothstep ramp so
- * the layer's transition into the sky gradient looks continuous instead of
- * a hard horizontal line. Run after the blob bake. */
-static void feather_strip_edges(uint8_t *a8, int w, int h, int fade_px)
-{
-    if (fade_px <= 0 || h < 2 * fade_px) return;
-    for (int y = 0; y < fade_px; ++y) {
-        float t = (float)y / (float)fade_px;
-        /* smoothstep(0, 1, t) = t*t*(3 - 2*t) */
-        float k = t * t * (3.0f - 2.0f * t);
-        int k_q = (int)(k * 256.0f);
-        uint8_t *row_top = &a8[y * w];
-        uint8_t *row_bot = &a8[(h - 1 - y) * w];
-        for (int x = 0; x < w; ++x) {
-            row_top[x] = (uint8_t)((row_top[x] * k_q) >> 8);
-            row_bot[x] = (uint8_t)((row_bot[x] * k_q) >> 8);
-        }
-    }
+    bake_cloud_scatter(a8_light, a8_shadow, a8_core, w, h, FIB_13, FIB_144, 0.45f, 0.90f);
 }
 
 static void bake_strip_for_layer(int layer, cloud_variant_t *v, int h)
@@ -1900,9 +1957,10 @@ static void bake_strip_for_layer(int layer, cloud_variant_t *v, int h)
         bake_strip_low(v->a8_light, v->a8_shadow, v->a8_core,
                        CLOUD_STRIP_W, h);
     }
-    feather_strip_edges(v->a8_light,  CLOUD_STRIP_W, h, FIB_13);
-    feather_strip_edges(v->a8_shadow, CLOUD_STRIP_W, h, FIB_13);
-    feather_strip_edges(v->a8_core,   CLOUD_STRIP_W, h, FIB_13);
+    /* Softens only the far off-screen strip margins — not the viewport band. */
+    feather_strip_edges(v->a8_light,  CLOUD_STRIP_W, h, FIB_8);
+    feather_strip_edges(v->a8_shadow, CLOUD_STRIP_W, h, FIB_8);
+    feather_strip_edges(v->a8_core,   CLOUD_STRIP_W, h, FIB_8);
 }
 
 static void init_cloud_strips(void)
@@ -1917,18 +1975,24 @@ static void init_cloud_strips(void)
         size_t bytes = (size_t)CLOUD_STRIP_W * strip->strip_h;
         for (int j = 0; j < CLOUD_VARIANT_COUNT; ++j) {
             cloud_variant_t *v = &strip->variant[j];
-            if (!v->a8_light) {
-                v->a8_light = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
-                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (v->a8_light) {
+                heap_caps_free(v->a8_light);
+                v->a8_light = NULL;
             }
-            if (!v->a8_shadow) {
-                v->a8_shadow = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
-                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (v->a8_shadow) {
+                heap_caps_free(v->a8_shadow);
+                v->a8_shadow = NULL;
             }
-            if (!v->a8_core) {
-                v->a8_core = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
-                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (v->a8_core) {
+                heap_caps_free(v->a8_core);
+                v->a8_core = NULL;
             }
+            v->a8_light = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
+                                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            v->a8_shadow = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
+                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            v->a8_core = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
+                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
             if (!v->a8_light || !v->a8_shadow || !v->a8_core) {
                 ESP_LOGE(TAG, "cloud strip %d variant %d alloc failed", i, j);
                 abort();
@@ -3023,10 +3087,11 @@ static void advance_cloud_scroll(float dt)
         s_strip[i].scroll_x += dt * speed_x;
         /* Vertical bob: gentle sin wave whose amplitude grows with wind.
          * Each layer gets a different phase so they don't bob in unison. */
-        float bob_amp = 0.4f + s_wind_kph_eff * 0.04f;     /* 0.4 .. ~5 px */
-        float bob_freq = 0.18f + 0.04f * (float)i;          /* slow, distinct */
+        float bob_amp = 0.50f + s_wind_kph_eff * 0.04f;
+        if (bob_amp > (float)FIB_13) bob_amp = (float)FIB_13;
+        float bob_freq = 0.32f + 0.07f * (float)i;
         s_strip[i].scroll_y_off =
-            bob_amp * sinf(t_now * bob_freq + (float)i * EVA_PHI);
+            bob_amp * sinf(t_now * bob_freq + (float)i * EVA_PHI + s_strip[i].scroll_x * 0.002f);
         while (s_strip[i].scroll_x >= (float)CLOUD_STRIP_W) {
             s_strip[i].scroll_x -= (float)CLOUD_STRIP_W;
         }
@@ -3145,6 +3210,11 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
  * Wraps the strip across the seam if scroll lands close to the edge.
  * `eff_y` accounts for the layer's wind-driven vertical bob — small offset
  * but stops the layer feeling locked into a fixed band. */
+static int strip_eff_y(const cloud_strip_t *strip)
+{
+    return strip->y_start + (int)strip->scroll_y_off;
+}
+
 static void blend_layer_variant(cloud_strip_t *strip,
                                 const cloud_variant_t *v,
                                 uint8_t alpha_scale,
@@ -3157,7 +3227,7 @@ static void blend_layer_variant(cloud_strip_t *strip,
     int max_src_w = CLOUD_STRIP_W - scroll;
     int first_w  = max_src_w >= EVA_WEATHER_RENDER_W ? EVA_WEATHER_RENDER_W : max_src_w;
     int second_w = EVA_WEATHER_RENDER_W - first_w;
-    int eff_y = strip->y_start + (int)strip->scroll_y_off;
+    int eff_y = strip_eff_y(strip);
 
     /* Per-pass alpha modulation by coverage.
      *
@@ -3282,16 +3352,15 @@ static void update_cloud_lifecycle(float dt)
         float duration = strip->morph_duration_s > 1.0f ? strip->morph_duration_s : 1.0f;
         strip->morph_t += dt / duration;
         if (strip->morph_t >= 1.0f) {
-            strip->active_variant ^= 1U;
+            uint8_t hidden = strip->active_variant ^ 1U;
+            strip->active_variant = hidden;
             strip->morphing = false;
             strip->morph_t = 0.0f;
             strip->morph_clock = 0.0f;
-            /* Previously re-baked the now-hidden variant here so the next
-             * morph would cross-fade to a fresh shape. That bake is a
-             * 30-80 ms synchronous spike that showed up as a periodic frame
-             * drop (min FPS ~14). The two variants baked at init are enough
-             * for a continuous, non-repetitive-looking drift; we just ping
-             * pong between them. No per-cycle re-bake → no spike. */
+            /* Re-bake the hidden variant so morph always crossfades to a fresh
+             * random shape. Stagger layers so only one strip spikes per frame. */
+            s_rng ^= (uint32_t)esp_timer_get_time() ^ ((uint32_t)i << 24);
+            bake_strip_for_layer(i, &strip->variant[hidden ^ 1U], strip->strip_h);
         }
     }
 }
@@ -3328,7 +3397,7 @@ static void draw_sun_cloud_light_variant(const cloud_strip_t *strip,
     if (!s_sun_visible || s_sun_strength <= 0.0f || is_night_kind(s_kind)) return;
     if (!strip || !v || !v->a8_light || alpha_scale == 0) return;
 
-    int eff_y = strip->y_start + (int)strip->scroll_y_off;
+    int eff_y = strip_eff_y(strip);
     int scroll = (int)strip->scroll_x;
     if (scroll >= CLOUD_STRIP_W) scroll = 0;
 
@@ -3540,61 +3609,178 @@ static void update_and_draw_particles(float dt, float t)
 }
 
 /* Real CG lightning: stepped leader channel + 3–4 return-stroke flickers (~40 ms
- * apart). We reuse one tortuous path (dart leaders follow the same channel).
- * Intracloud "sheet" flashes omit the visible bolt ~22% of strikes. */
+ * apart). Strike geometry is picked at random each flash — diagonal, vertical,
+ * upward, intracloud — so bolts can cross the frame in many directions. */
+static void clamp_lightning_xy(float *px, float *py, int w, int h)
+{
+    if (*px < 2.0f) *px = 2.0f;
+    if (*px > (float)(w - 3)) *px = (float)(w - 3);
+    if (*py < 2.0f) *py = 2.0f;
+    if (*py > (float)(h - 3)) *py = (float)(h - 3);
+}
+
 static void generate_lightning_bolt(void)
 {
     const int w = EVA_WEATHER_RENDER_W;
     const int h = EVA_WEATHER_RENDER_H;
 
-    s_lightning_sheet_only = (rndf(0.0f, 1.0f) < 0.22f);
+    s_lightning_sheet_only = (rndf(0.0f, 1.0f) < 0.20f);
 
-    float sx = w * rndf(0.22f, 0.78f);
-    float sy = h * rndf(0.08f, 0.26f);   /* cloud base, not screen top */
-    float ex = sx + rndf(-w * 0.14f, w * 0.14f);
-    float ey = h * rndf(0.58f, 0.84f);
+    float sx, sy, ex, ey;
+    int style = (int)rndf(0.0f, 7.0f);
+
+    switch (style) {
+    case 0: /* classic — cloud base, steep drop */
+        sx = w * rndf(0.18f, 0.82f);
+        sy = h * rndf(0.06f, 0.24f);
+        ex = sx + w * rndf(-0.20f, 0.20f);
+        ey = h * rndf(0.62f, 0.90f);
+        break;
+    case 1: /* top-left → bottom-right */
+        sx = w * rndf(0.02f, 0.24f);
+        sy = h * rndf(0.04f, 0.20f);
+        ex = w * rndf(0.70f, 0.98f);
+        ey = h * rndf(0.58f, 0.92f);
+        break;
+    case 2: /* top-right → lower middle */
+        sx = w * rndf(0.76f, 0.98f);
+        sy = h * rndf(0.04f, 0.22f);
+        ex = w * rndf(0.28f, 0.58f);
+        ey = h * rndf(0.52f, 0.82f);
+        break;
+    case 3: /* random top → random bottom (wide horizontal span) */
+        sx = w * rndf(0.02f, 0.42f);
+        sy = h * rndf(0.05f, 0.26f);
+        ex = w * rndf(0.58f, 0.98f);
+        ey = h * rndf(0.58f, 0.92f);
+        if (rndf(0.0f, 1.0f) < 0.45f) {
+            float tx = sx, ty = sy;
+            sx = ex; sy = ey;
+            ex = tx; ey = ty;
+        }
+        break;
+    case 4: /* bottom → cloud (upward leader) */
+        sx = w * rndf(0.06f, 0.94f);
+        sy = h * rndf(0.66f, 0.92f);
+        ex = sx + w * rndf(-0.28f, 0.28f);
+        ey = h * rndf(0.05f, 0.26f);
+        break;
+    case 5: /* lower-left → upper-right */
+        sx = w * rndf(0.02f, 0.28f);
+        sy = h * rndf(0.62f, 0.90f);
+        ex = w * rndf(0.68f, 0.98f);
+        ey = h * rndf(0.06f, 0.28f);
+        break;
+    default: /* intracloud crawl — upper sky only */
+        sx = w * rndf(0.08f, 0.92f);
+        sy = h * rndf(0.08f, 0.30f);
+        ex = sx + w * rndf(-0.38f, 0.38f);
+        ey = sy + h * rndf(0.04f, 0.24f);
+        if (rndf(0.0f, 1.0f) < 0.35f) {
+            s_lightning_sheet_only = true;
+        }
+        break;
+    }
+
+    bool cloud_at_end = (ey < sy);
+    float dx = ex - sx;
+    float dy = ey - sy;
+    float seg_len = sqrtf(dx * dx + dy * dy);
+    if (seg_len < 8.0f) {
+        seg_len = 8.0f;
+        dy = (cloud_at_end ? -1.0f : 1.0f) * seg_len;
+        ey = sy + dy;
+        clamp_lightning_xy(&ex, &ey, w, h);
+        dx = ex - sx;
+        dy = ey - sy;
+        seg_len = sqrtf(dx * dx + dy * dy);
+        if (seg_len < 1.0f) seg_len = 1.0f;
+    }
+    float perp_x = -dy / seg_len;
+    float perp_y = dx / seg_len;
 
     s_lightning_pt_count = LIGHTNING_PT_MAX;
     for (int i = 0; i < LIGHTNING_PT_MAX; ++i) {
         float u = (float)i / (float)(LIGHTNING_PT_MAX - 1);
-        float px = sx + (ex - sx) * u;
-        float py = sy + (ey - sy) * u;
+        float px = sx + dx * u;
+        float py = sy + dy * u;
         if (i > 0 && i < LIGHTNING_PT_MAX - 1) {
-            /* Jitter shrinks toward the ground — dielectric-breakdown feel. */
-            float amp = ((1.0f - u) * (float)FIB_55 + (float)FIB_13) * 0.85f;
+            float amp = cloud_at_end
+                ? (u * (float)FIB_55 + (float)FIB_13) * 0.85f
+                : ((1.0f - u) * (float)FIB_55 + (float)FIB_13) * 0.85f;
             px += rndf(-amp, amp);
-            py += rndf(-amp * 0.28f, amp * 0.32f);
+            py += rndf(-amp * 0.35f, amp * 0.35f);
         }
-        if (px < 2.0f) px = 2.0f;
-        if (px > (float)(w - 3)) px = (float)(w - 3);
-        if (py < 2.0f) py = 2.0f;
-        if (py > (float)(h - 3)) py = (float)(h - 3);
+        clamp_lightning_xy(&px, &py, w, h);
         s_lightning_x[i] = (int16_t)px;
         s_lightning_y[i] = (int16_t)py;
     }
 
+    if (sy <= ey) {
+        s_lightning_flash_x = (int16_t)sx;
+        s_lightning_flash_y = (int16_t)sy;
+    } else {
+        s_lightning_flash_x = (int16_t)ex;
+        s_lightning_flash_y = (int16_t)ey;
+    }
+
     s_lightning_has_branch = false;
     s_lightning_branch_pts = 0;
-    if (!s_lightning_sheet_only && rndf(0.0f, 1.0f) < 0.58f) {
-        int fork = (int)rndf(3.0f, (float)(LIGHTNING_PT_MAX - 5));
+    if (!s_lightning_sheet_only && rndf(0.0f, 1.0f) < 0.62f) {
+        int fork = (int)rndf(2.0f, (float)(LIGHTNING_PT_MAX - 4));
         float bx = (float)s_lightning_x[fork];
         float by = (float)s_lightning_y[fork];
-        float dir = rndf(-1.2f, 1.2f);
-        s_lightning_branch_pts = 4;
+        float branch_sign = rndf(0.0f, 1.0f) < 0.5f ? -1.0f : 1.0f;
+        float along = rndf(0.35f, 0.85f);
+        s_lightning_branch_pts = (int)rndf(3.0f, (float)(LIGHTNING_BRANCH_MAX + 1));
+        if (s_lightning_branch_pts > LIGHTNING_BRANCH_MAX) {
+            s_lightning_branch_pts = LIGHTNING_BRANCH_MAX;
+        }
         for (int j = 0; j < s_lightning_branch_pts; ++j) {
-            float t = (float)(j + 1) / (float)s_lightning_branch_pts;
-            bx += dir * rndf(10.0f, 26.0f);
-            by += rndf(14.0f, 34.0f);
-            if (bx < 2.0f) bx = 2.0f;
-            if (bx > (float)(w - 3)) bx = (float)(w - 3);
-            if (by > (float)(h - 3)) by = (float)(h - 3);
+            bx += perp_x * branch_sign * rndf(8.0f, 28.0f)
+                + (dx / seg_len) * rndf(-6.0f, along * 18.0f);
+            by += perp_y * branch_sign * rndf(6.0f, 22.0f)
+                + (dy / seg_len) * rndf(8.0f, 32.0f);
+            clamp_lightning_xy(&bx, &by, w, h);
             s_lightning_bx[j] = (int16_t)bx;
             s_lightning_by[j] = (int16_t)by;
-            dir += rndf(-0.55f, 0.55f);
-            (void)t;
+            branch_sign += rndf(-0.45f, 0.45f);
+            along *= 0.88f;
         }
         s_lightning_has_branch = true;
     }
+}
+
+/* Dart leaders reuse the channel — nudge interior points slightly on later strokes. */
+static void nudge_lightning_channel(uint8_t stroke_idx)
+{
+    if (stroke_idx == 0 || s_lightning_sheet_only) return;
+
+    const int w = EVA_WEATHER_RENDER_W;
+    const int h = EVA_WEATHER_RENDER_H;
+    for (int i = 1; i < LIGHTNING_PT_MAX - 1; ++i) {
+        float px = (float)s_lightning_x[i] + rndf(-3.0f, 3.0f);
+        float py = (float)s_lightning_y[i] + rndf(-1.8f, 1.8f);
+        clamp_lightning_xy(&px, &py, w, h);
+        s_lightning_x[i] = (int16_t)px;
+        s_lightning_y[i] = (int16_t)py;
+    }
+    if (!s_lightning_has_branch) return;
+    for (int j = 0; j < s_lightning_branch_pts; ++j) {
+        float px = (float)s_lightning_bx[j] + rndf(-2.0f, 2.0f);
+        float py = (float)s_lightning_by[j] + rndf(-1.2f, 1.2f);
+        clamp_lightning_xy(&px, &py, w, h);
+        s_lightning_bx[j] = (int16_t)px;
+        s_lightning_by[j] = (int16_t)py;
+    }
+}
+
+static float lightning_stroke_envelope(float age_s)
+{
+    if (age_s < 0.0f) return 0.0f;
+    if (age_s < 0.006f) return age_s / 0.006f;
+    if (age_s > 0.14f) return 0.0f;
+    return expf(-(age_s - 0.006f) * 34.0f);
 }
 
 static void start_lightning_strike(float t)
@@ -3602,10 +3788,29 @@ static void start_lightning_strike(float t)
     (void)t;
     generate_lightning_bolt();
     s_lightning_active = true;
-    s_lightning_pulse_idx = 0;
-    s_lightning_pulse_frame = 0;
-    s_lightning_peak = (float)(FIB_144 + FIB_34) + rndf(0.0f, (float)FIB_34);
-    s_lightning_alpha = s_lightning_peak;
+    s_lightning_in_fade = false;
+    s_lightning_strike_age = 0.0f;
+    s_lightning_stroke_next = 0;
+    s_lightning_stroke_total = (uint8_t)rndf(2.0f, 6.0f);
+    if (s_lightning_stroke_total > LIGHTNING_STROKE_MAX) {
+        s_lightning_stroke_total = LIGHTNING_STROKE_MAX;
+    }
+
+    float acc = rndf(0.015f, 0.045f);
+    for (int i = 0; i < (int)s_lightning_stroke_total; ++i) {
+        s_lightning_stroke_t[i] = acc;
+        s_lightning_stroke_k[i] = rndf(0.68f, 1.0f)
+            * (1.0f - (float)i * rndf(0.06f, 0.12f));
+        if (i > 0) {
+            acc += rndf(0.032f, 0.088f);
+        }
+    }
+
+    s_lightning_peak = (float)(FIB_144 + FIB_13) + rndf(0.0f, (float)FIB_21);
+    s_lightning_afterglow = s_lightning_peak * rndf(0.32f, 0.50f);
+    s_lightning_channel_alpha = s_lightning_afterglow * 0.35f;
+    s_lightning_flash_alpha = s_lightning_afterglow * 0.22f;
+    s_lightning_alpha = s_lightning_channel_alpha;
 }
 
 static void schedule_next_lightning_strike(float t)
@@ -3619,13 +3824,20 @@ static void draw_lightning_path(const int16_t *xs, const int16_t *ys, int pts,
                                 uint16_t core, uint16_t glow, uint8_t alpha)
 {
     if (pts < 2 || alpha < FIB_2) return;
-    uint8_t glow_a = clamp_u8((int)((alpha * (int)FIB_144) / 255));
-    uint8_t core_a = clamp_u8((int)alpha + FIB_21);
+
+    uint8_t core_a = clamp_u8((int)alpha);
     for (int i = 1; i < pts; ++i) {
-        draw_line(xs[i - 1], ys[i - 1], xs[i], ys[i], glow, glow_a, 2);
+        draw_rain_streak(xs[i - 1], ys[i - 1], xs[i], ys[i], core, core_a);
     }
-    for (int i = 1; i < pts; ++i) {
-        draw_line(xs[i - 1], ys[i - 1], xs[i], ys[i], core, core_a, 1);
+
+    /* Soft halo only during the brightest return-stroke peaks. */
+    if (alpha >= FIB_89) {
+        uint8_t glow_a = clamp_u8((int)((alpha * (int)FIB_34) / 255));
+        for (int i = 1; i < pts; i += 2) {
+            int ox = (i & 2) ? 1 : -1;
+            draw_rain_streak(xs[i - 1] + ox, ys[i - 1], xs[i] + ox, ys[i],
+                             glow, glow_a);
+        }
     }
 }
 
@@ -3635,46 +3847,39 @@ static void composite_lightning_flash(uint8_t alpha)
 
     uint16_t cool = rgb565(196, 214, 255);
     uint16_t warm = rgb565(255, 250, 242);
-    int cx = s_lightning_x[0];
-    int cy = s_lightning_y[0];
+    int cx = s_lightning_flash_x;
+    int cy = s_lightning_flash_y;
 
-    /* Cloud-body illumination — brightest near the channel origin. */
-    draw_filled_circle(cx, cy, FIB_144, cool, clamp_u8((alpha * FIB_34) / 255));
-    draw_filled_circle(cx, cy, FIB_89, warm, clamp_u8((alpha * FIB_55) / 255));
+    /* Regional cloud illumination — no fat blobs along the channel. */
+    draw_filled_circle(cx, cy, FIB_89, cool, clamp_u8((alpha * FIB_21) / 255));
+    draw_filled_circle(cx, cy, FIB_55, warm, clamp_u8((alpha * FIB_34) / 255));
 
-    if (!s_lightning_sheet_only) {
-        for (int i = 0; i < s_lightning_pt_count; i += 2) {
-            int r = FIB_34 + (i >> 1) * FIB_3;
-            if (r > FIB_55) r = FIB_55;
-            uint8_t a = clamp_u8((alpha * (200 - i * FIB_8)) / 255);
-            draw_filled_circle(s_lightning_x[i], s_lightning_y[i], r, cool, a);
-        }
-    }
-
-    /* Upper-sky wash — stronger at the top, mimics cloud volume lighting. */
-    uint8_t sky_a = clamp_u8((alpha * FIB_21) / 255);
+    /* Upper-sky wash — mimics cloud volume lighting. */
+    uint8_t sky_a = clamp_u8((alpha * FIB_13) / 255);
     if (sky_a >= FIB_2) {
-        int y1 = (int)((float)EVA_WEATHER_RENDER_H * 0.62f);
-        for (int y = 0; y < y1; y += 3) {
+        int y1 = (int)((float)EVA_WEATHER_RENDER_H * 0.58f);
+        for (int y = 0; y < y1; y += 4) {
             uint8_t row_a = (uint8_t)((sky_a * (y1 - y)) / (y1 + 1));
             if (row_a < FIB_2) continue;
             uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
-            for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 3) {
+            for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 4) {
                 row[x] = blend565(row[x], warm, row_a);
             }
         }
     }
 }
 
-/* Lightning has two phases:
- *   1. update_lightning(t)         — schedules strikes, runs multi-pulse
- *                                    return-stroke flicker (~40 ms apart).
- *   2. composite_lightning_on_render() — regional cloud flash + bolt path.
+/* Lightning lifecycle (PyLightning / return-stroke model):
+ *   1. update_lightning(dt,t) — one fixed channel, 2–5 return strokes with
+ *      irregular spacing; channel never drops to zero between strokes.
+ *   2. composite_lightning_on_render() — thin bolt + soft regional flash.
  */
-static void update_lightning(float t)
+static void update_lightning(float dt, float t)
 {
     if (s_kind != WEATHER_THUNDERSTORM && s_kind != WEATHER_HAIL) {
         s_lightning_alpha = 0.0f;
+        s_lightning_channel_alpha = 0.0f;
+        s_lightning_flash_alpha = 0.0f;
         s_lightning_active = false;
         s_lightning_next_strike_at = 0.0f;
         return;
@@ -3684,28 +3889,56 @@ static void update_lightning(float t)
         schedule_next_lightning_strike(t);
     }
 
-    static const float pulse_k[4] = {
-        1.00f,
-        (float)FIB_55 / (float)FIB_89,
-        (float)FIB_34 / (float)FIB_89,
-        (float)FIB_21 / (float)FIB_89,
-    };
-
     if (s_lightning_active) {
-        s_lightning_pulse_frame++;
-        if (s_lightning_pulse_frame <= FIB_2) {
-            s_lightning_alpha = s_lightning_peak * pulse_k[s_lightning_pulse_idx];
-        } else if (s_lightning_pulse_frame == FIB_3) {
-            s_lightning_alpha = s_lightning_peak * 0.05f;
-        } else {
-            s_lightning_pulse_frame = 0;
-            s_lightning_pulse_idx++;
-            if (s_lightning_pulse_idx >= 4) {
+        s_lightning_strike_age += dt;
+
+        while (s_lightning_stroke_next < s_lightning_stroke_total
+               && s_lightning_strike_age >= s_lightning_stroke_t[s_lightning_stroke_next]) {
+            nudge_lightning_channel(s_lightning_stroke_next);
+            s_lightning_stroke_next++;
+        }
+
+        float channel = s_lightning_afterglow;
+        float flash = s_lightning_afterglow * 0.62f;
+
+        for (int i = 0; i < (int)s_lightning_stroke_total; ++i) {
+            float env = lightning_stroke_envelope(
+                s_lightning_strike_age - s_lightning_stroke_t[i]);
+            if (env <= 0.001f) continue;
+            float stroke = s_lightning_peak * s_lightning_stroke_k[i] * env;
+            if (stroke > channel) channel = stroke;
+            if (stroke * 0.72f > flash) flash = stroke * 0.72f;
+        }
+
+        if (channel > s_lightning_afterglow * 1.35f) {
+            channel *= 0.93f + 0.07f * sinf(s_lightning_strike_age * 380.0f + t * 2.7f);
+        }
+
+        float last_end = s_lightning_stroke_t[s_lightning_stroke_total - 1] + 0.10f;
+        if (s_lightning_strike_age > last_end) {
+            if (!s_lightning_in_fade) {
+                s_lightning_in_fade = true;
+                s_lightning_fade_start = s_lightning_strike_age;
+                s_lightning_fade_dur = rndf(0.20f, 0.42f);
+            }
+            float fade_u = (s_lightning_strike_age - s_lightning_fade_start)
+                / s_lightning_fade_dur;
+            if (fade_u >= 1.0f) {
                 s_lightning_active = false;
+                s_lightning_channel_alpha = 0.0f;
+                s_lightning_flash_alpha = 0.0f;
                 s_lightning_alpha = 0.0f;
                 schedule_next_lightning_strike(t);
+                return;
             }
+            float fade_k = (1.0f - fade_u) * (1.0f - fade_u);
+            channel *= fade_k;
+            flash *= fade_k;
         }
+
+        s_lightning_channel_alpha = channel;
+        s_lightning_flash_alpha = flash;
+        s_lightning_alpha = channel;
         return;
     }
 
@@ -3716,20 +3949,23 @@ static void update_lightning(float t)
 
 static void composite_lightning_on_render(void)
 {
-    if (s_lightning_alpha < 2.0f) return;
-    uint8_t alpha = clamp_u8((int)s_lightning_alpha);
+    uint8_t flash_a = clamp_u8((int)s_lightning_flash_alpha);
+    uint8_t bolt_a = clamp_u8((int)s_lightning_channel_alpha);
+    if (flash_a < FIB_2 && bolt_a < FIB_2) return;
 
-    composite_lightning_flash(alpha);
+    if (flash_a >= FIB_2) {
+        composite_lightning_flash(flash_a);
+    }
 
-    if (s_lightning_sheet_only) return;
+    if (s_lightning_sheet_only || bolt_a < FIB_2) return;
 
-    uint16_t core = rgb565(245, 252, 255);
-    uint16_t glow = rgb565(176, 204, 255);
+    uint16_t core = rgb565(248, 252, 255);
+    uint16_t glow = rgb565(188, 210, 255);
     draw_lightning_path(s_lightning_x, s_lightning_y, s_lightning_pt_count,
-                        core, glow, alpha);
+                        core, glow, bolt_a);
     if (s_lightning_has_branch) {
         draw_lightning_path(s_lightning_bx, s_lightning_by, s_lightning_branch_pts,
-                            core, glow, clamp_u8((alpha * FIB_89) / 255));
+                            core, glow, clamp_u8((bolt_a * FIB_89) / 255));
     }
 }
 
@@ -4134,6 +4370,8 @@ static void render_weather(float dt)
         reset_glass_overlay_for_kind();
         s_lightning_active = false;
         s_lightning_alpha = 0.0f;
+        s_lightning_channel_alpha = 0.0f;
+        s_lightning_flash_alpha = 0.0f;
         s_lightning_next_strike_at = 0.0f;
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
@@ -4180,7 +4418,7 @@ static void render_weather(float dt)
     int64_t tb3 = esp_timer_get_time();
     s_prof_particles_us += (tb3 - tb_overlay0);
 
-    update_lightning(t);
+    update_lightning(dt, t);
     composite_lightning_on_render();
     int64_t tb4 = esp_timer_get_time();
     s_prof_lightning_us += (tb4 - tb3);
