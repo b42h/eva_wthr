@@ -16,7 +16,14 @@
 #define WIFI_SSID       "getRicher"
 #define WIFI_PASSWORD   "sure0420"
 #define WIFI_START_DELAY_MS  10000
-#define WIFI_MAX_RETRY  10
+/* Immediate reconnect attempts on disconnect before handing off to the
+ * backoff supervisor. Recovers from brief glitches without a visible pause. */
+#define FAST_RETRY_LIMIT     5
+/* Exponential backoff bounds for the supervisor loop (never gives up). */
+#define WIFI_BACKOFF_MIN_MS  2000
+#define WIFI_BACKOFF_MAX_MS  60000
+/* How long to wait for an IP after (re)arming a connect attempt. */
+#define WIFI_CONNECT_WAIT_MS 30000
 
 static const char *TAG = "eva_wifi";
 
@@ -50,16 +57,20 @@ static void on_wifi_event(void *arg, esp_event_base_t base, int32_t id, void *da
         if (s_evt) {
             xEventGroupClearBits(s_evt, BIT_CONNECTED);
         }
-        if (s_retry < WIFI_MAX_RETRY) {
-            s_retry++;
-            ESP_LOGW(TAG, "disconnected, retry %d/%d", s_retry, WIFI_MAX_RETRY);
+        /* Never give up: the supervisor task (wifi_task) owns reconnection with
+         * exponential backoff, so the AP coming back later is always picked up.
+         * The first FAST_RETRY_LIMIT disconnects reconnect immediately for a
+         * snappy recovery from brief glitches; beyond that we set BIT_FAIL to
+         * hand control to the backoff loop instead of hammering the radio. */
+        s_retry++;
+        if (s_retry <= FAST_RETRY_LIMIT) {
+            ESP_LOGW(TAG, "disconnected, fast retry %d/%d", s_retry, FAST_RETRY_LIMIT);
             snprintf(s_status_buf, sizeof(s_status_buf),
-                     "Wi-Fi: retry %d/%d", s_retry, WIFI_MAX_RETRY);
+                     "Wi-Fi: retry %d", s_retry);
             report(s_status_buf);
             esp_wifi_connect();
-        } else {
-            ESP_LOGE(TAG, "giving up after %d retries", WIFI_MAX_RETRY);
-            report("Wi-Fi: failed");
+        } else if (s_evt) {
+            /* Defer to the backoff supervisor; it will re-arm esp_wifi_connect. */
             xEventGroupSetBits(s_evt, BIT_FAIL);
         }
     }
@@ -246,21 +257,47 @@ static void wifi_task(void *arg)
         return;
     }
 
-    EventBits_t bits = xEventGroupWaitBits(
-        s_evt, BIT_CONNECTED | BIT_FAIL, pdFALSE, pdFALSE,
-        pdMS_TO_TICKS(30000));
+    /* Supervisor loop — never exits. Waits for an IP; if none arrives in the
+     * window (AP down / wrong band / out of range), backs off and re-arms the
+     * connect. The moment the AP returns we connect and sync time. Backoff
+     * grows from WIFI_BACKOFF_MIN_MS to WIFI_BACKOFF_MAX_MS so a long outage
+     * doesn't keep the radio busy, while a brief one recovers quickly. */
+    int backoff_ms = WIFI_BACKOFF_MIN_MS;
+    bool time_sync_started = false;
+    while (true) {
+        EventBits_t bits = xEventGroupWaitBits(
+            s_evt, BIT_CONNECTED | BIT_FAIL, pdFALSE, pdFALSE,
+            pdMS_TO_TICKS(WIFI_CONNECT_WAIT_MS));
 
-    if (bits & BIT_CONNECTED) {
-        /* Time sync is started from a separate, low-priority task to avoid
-         * racing with the hosted Wi-Fi event/RPC stack. Earlier attempts to
-         * use lwIP SNTP caused a board reset ~3s later, so this task uses
-         * HTTP Date headers over the TCP path instead. */
-        xTaskCreate(time_sync_task, "eva_time", 4096, NULL, 2, NULL);
-    } else {
-        ESP_LOGE(TAG, "no IP within 30s (bits=0x%x)", (unsigned)bits);
+        if (bits & BIT_CONNECTED) {
+            backoff_ms = WIFI_BACKOFF_MIN_MS;   /* reset on success */
+            if (!time_sync_started) {
+                /* Time sync runs in its own low-priority task to avoid racing
+                 * the hosted Wi-Fi event/RPC stack. lwIP SNTP reset the board
+                 * ~3s in, so it uses HTTP Date headers over TCP instead.
+                 * Started once; it then re-syncs periodically on its own. */
+                xTaskCreate(time_sync_task, "eva_time", 4096, NULL, 2, NULL);
+                time_sync_started = true;
+            }
+            /* Block until the link drops, then fall through to reconnect. */
+            xEventGroupWaitBits(s_evt, BIT_FAIL, pdTRUE, pdFALSE, portMAX_DELAY);
+            ESP_LOGW(TAG, "link lost, reconnecting");
+        } else {
+            /* No IP within the window. Back off, re-arm, and try again. */
+            ESP_LOGW(TAG, "no IP within %ds; backoff %d ms (bits=0x%x)",
+                     WIFI_CONNECT_WAIT_MS / 1000, backoff_ms, (unsigned)bits);
+            snprintf(s_status_buf, sizeof(s_status_buf),
+                     "Wi-Fi: retrying in %ds", backoff_ms / 1000);
+            report(s_status_buf);
+            vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+            backoff_ms *= 2;
+            if (backoff_ms > WIFI_BACKOFF_MAX_MS) backoff_ms = WIFI_BACKOFF_MAX_MS;
+        }
+        /* Re-arm: clear stale fail bit, reset fast-retry budget, reconnect. */
+        xEventGroupClearBits(s_evt, BIT_FAIL);
+        s_retry = 0;
+        esp_wifi_connect();
     }
-
-    vTaskDelete(NULL);
 }
 
 void eva_wifi_start(void)

@@ -279,6 +279,22 @@ static float s_sun_strength = 0.0f;
  * bright top-down light at midday. -1 while the sun is below the horizon. */
 static float s_sun_elevation = -1.0f;
 
+/* Normalised luminary position — single source of truth for fill_sky() and
+ * draw_sun_or_moon(). Refreshed once per bg-cache pass in render_weather(). */
+typedef struct {
+    float x_n;
+    float y_n;
+    float elevation;   /* sin(progress·π): negative = below horizon */
+    float warmth;      /* radial sky glow strength, 0 below horizon / at night */
+    bool  valid;       /* in visible arc (incl. glide zones) */
+} luminary_pos_t;
+static luminary_pos_t s_luminary_pos;
+
+#define SUN_HORIZON_Y      0.90f
+#define SUN_APEX_Y_SUMMER  0.12f
+#define SUN_APEX_Y_WINTER  0.35f
+#define SET_GLIDE_MIN      25.0f
+
 static uint16_t s_target = 120;
 static uint16_t s_max_target = 160;
 static uint32_t s_rng = 0x4880e5a5U;
@@ -292,9 +308,21 @@ static int64_t s_accum_lvgl_slot_us;
 static uint8_t s_over_budget;
 static uint8_t s_under_budget;
 static float s_lightning_alpha;
-static uint8_t s_lightning_cooldown;
-static int16_t s_lightning_x[6];
-static int16_t s_lightning_y[6];
+static float s_lightning_peak;
+static float s_lightning_next_strike_at;
+static bool s_lightning_active;
+static bool s_lightning_sheet_only;
+static bool s_lightning_has_branch;
+static uint8_t s_lightning_pulse_idx;
+static uint8_t s_lightning_pulse_frame;
+#define LIGHTNING_PT_MAX     FIB_13
+#define LIGHTNING_BRANCH_MAX FIB_5
+static int s_lightning_pt_count;
+static int s_lightning_branch_pts;
+static int16_t s_lightning_x[LIGHTNING_PT_MAX];
+static int16_t s_lightning_y[LIGHTNING_PT_MAX];
+static int16_t s_lightning_bx[LIGHTNING_BRANCH_MAX];
+static int16_t s_lightning_by[LIGHTNING_BRANCH_MAX];
 static uint8_t s_bg_ttl;
 static float s_bg_dt;
 static bool s_visible;
@@ -1135,28 +1163,54 @@ static void draw_scene_text_overlays(void)
     blit_text_slot(&s_scene_slot, 0, 0, rgb565(255, 255, 255), 240);
 }
 
-static void fill_gradient(rgb_t top, rgb_t bottom)
+static rgb_t lerp_rgb(rgb_t a, rgb_t b, float t);
+static float solar_declination_deg(void);
+static float sky_cover_fraction(void);
+static float sun_curve(float progress);
+
+static void fill_sky(rgb_t top, rgb_t bottom, float sun_x_n, float sun_y_n, float warmth)
 {
-    /* Non-linear vertical blend so the `bottom` (horizon) colour concentrates
-     * in the lower part of the screen instead of spreading evenly. With a
-     * gamma > 1 the top band holds its colour through most of the height and
-     * the warm horizon glow ramps up quickly only near the bottom — which is
-     * how a real sunrise/sunset looks (warm band hugging the horizon, cooler
-     * sky above). At gamma = 1 this is the old linear gradient. */
+    /* Vertical base (gamma-biased horizon) plus optional radial warm glow
+     * centred on the sun. warmth=0 degenerates to the old fill_gradient(). */
     const float horizon_gamma = 2.2f;
-    for (int y = 0; y < EVA_WEATHER_RENDER_H; ++y) {
-        float yn = (float)y / (float)(EVA_WEATHER_RENDER_H - 1);  /* 0 top .. 1 bottom */
-        float t = powf(yn, horizon_gamma);                        /* bias toward bottom */
+    const int W = EVA_WEATHER_RENDER_W;
+    const int H = EVA_WEATHER_RENDER_H;
+    const int sun_x = (int)(sun_x_n * (float)W);
+    const int sun_y = (int)(sun_y_n * (float)H);
+    const float R2 = (float)(W * W);
+    const rgb_t warm_tint = {
+        .r = (uint8_t)(bottom.r < 250 ? bottom.r + (255 - bottom.r) / 3 : 255),
+        .g = (uint8_t)(bottom.g * 85 / 100),
+        .b = (uint8_t)(bottom.b * 55 / 100),
+    };
+    const bool use_glow = warmth > 0.01f;
+
+    for (int y = 0; y < H; ++y) {
+        float yn = (float)y / (float)(H - 1);
+        float t = powf(yn, horizon_gamma);
         int ti = (int)(t * 255.0f + 0.5f);
-        rgb_t c = {
+        rgb_t base = {
             .r = (uint8_t)(top.r + (((int)bottom.r - top.r) * ti) / 255),
             .g = (uint8_t)(top.g + (((int)bottom.g - top.g) * ti) / 255),
             .b = (uint8_t)(top.b + (((int)bottom.b - top.b) * ti) / 255),
         };
-        uint16_t px = rgb565_from(c);
-        uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
-        for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
-            row[x] = px;
+        uint16_t *row = &s_buf[y * W];
+        if (!use_glow) {
+            uint16_t px = rgb565_from(base);
+            for (int x = 0; x < W; ++x) {
+                row[x] = px;
+            }
+            continue;
+        }
+        for (int x = 0; x < W; ++x) {
+            int dx = x - sun_x;
+            int dy = y - sun_y;
+            float d2 = (float)(dx * dx + dy * dy);
+            float glow = 1.0f - d2 / R2;
+            if (glow < 0.0f) glow = 0.0f;
+            float blend = glow * warmth;
+            rgb_t c = lerp_rgb(base, warm_tint, blend);
+            row[x] = rgb565_from(c);
         }
     }
 }
@@ -1215,19 +1269,23 @@ static void sun_events(int *out_sunrise, int *out_sunset)
  * a long June evening lingers longer than a crisp winter one. Result is
  * clamped to a sane [20, 180] min so high-latitude edge cases (where the sun
  * never reaches −6°) don't explode. */
-static float civil_twilight_minutes(void)
+static float solar_declination_deg(void)
 {
-    /* Solar declination δ from day-of-year (Cooper's approximation). */
     time_t now = time(NULL);
-    int doy = 172;   /* default ~summer solstice if clock unsynced */
+    int doy = 172;
     if (now > 1700000000) {
         struct tm tm_now = {0};
         localtime_r(&now, &tm_now);
-        doy = tm_now.tm_yday + 1;   /* 1..366 */
+        doy = tm_now.tm_yday + 1;
     }
     const float DEG2RAD = 3.14159265f / 180.0f;
-    float decl_deg = 23.44f * sinf(DEG2RAD * (360.0f / 365.0f) * (float)(doy - 81));
-    float decl = decl_deg * DEG2RAD;
+    return 23.44f * sinf(DEG2RAD * (360.0f / 365.0f) * (float)(doy - 81));
+}
+
+static float civil_twilight_minutes(void)
+{
+    const float DEG2RAD = 3.14159265f / 180.0f;
+    float decl = solar_declination_deg() * DEG2RAD;
     float lat  = EVA_OBSERVER_LAT_DEG * DEG2RAD;
 
     float cos_lat = cosf(lat), sin_lat = sinf(lat);
@@ -1272,7 +1330,6 @@ static rgb_t lerp_rgb(rgb_t a, rgb_t b, float t)
  *   phase >= twi       → full day
  * The same curve runs forward at sunrise and backward at sunset, so dawn and
  * dusk share the warm-horizon treatment symmetrically. */
-static float sun_curve(float progress);   /* fwd decl: defined below */
 
 /* Night-ness factor 0..1 for the current minute, shared by every sky that
  * has a day<->night cycle. 0 = sun above horizon (full day), 1 = past civil
@@ -1303,7 +1360,7 @@ static scene_daypart_t scene_daypart_now(void)
     sun_events(&sr, &ss);
     int m = minutes_now();
     float n = sky_nightness(m, sr, ss);
-    if (n >= 0.88f) {
+    if (n >= 0.92f) {
         return SCENE_DAYPART_NIGHT;
     }
     if (n > 0.08f) {
@@ -1320,13 +1377,40 @@ static scene_daypart_t scene_daypart_now(void)
 
 static sky_t clear_sky_palette(int m, int sr, int ss)
 {
+    float cover = sky_cover_fraction();
+    float decl = solar_declination_deg();
+
     /* Keyframe colours along the day. */
     const rgb_t night_top = {8, 12, 28};
     const rgb_t night_bot = {20, 20, 42};
-    const rgb_t twi_top   = {38, 40, 78};      /* indigo at the terminator */
-    const rgb_t twi_bot   = {255, 150, 96};    /* warm orange horizon glow */
-    const rgb_t day_top   = {24, 78, 142};     /* deep blue zenith at noon */
-    const rgb_t day_bot   = {120, 178, 224};   /* pale blue horizon at noon */
+    const rgb_t twi_top   = {38, 40, 78};
+    rgb_t twi_bot_warm    = {255, 150, 96};
+    rgb_t twi_bot_muted   = {175, 158, 148};
+    rgb_t day_top         = {24, 78, 142};
+    rgb_t day_bot         = {120, 178, 224};
+
+    /* C1: cloud cover desaturates day and sunset colours. */
+    {
+        rgb_t day_grey = {72, 88, 102};
+        day_top = lerp_rgb(day_top, day_grey, cover * 0.42f);
+        day_bot = lerp_rgb(day_bot, day_grey, cover * 0.38f);
+        twi_bot_warm = lerp_rgb(twi_bot_warm, twi_bot_muted, cover);
+    }
+
+    /* C2: seasonal warm shift — winter redder, summer more golden. */
+    {
+        float season = decl / 23.44f;
+        if (season < -1.0f) season = -1.0f;
+        else if (season > 1.0f) season = 1.0f;
+        int r_shift = (int)(-season * 14.0f);
+        int g_shift = (int)(season * 10.0f);
+        int b_shift = (int)(season * 6.0f);
+        twi_bot_warm.r = clamp_u8((int)twi_bot_warm.r + r_shift);
+        twi_bot_warm.g = clamp_u8((int)twi_bot_warm.g + g_shift);
+        twi_bot_warm.b = clamp_u8((int)twi_bot_warm.b + b_shift);
+    }
+
+    const rgb_t twi_bot     = twi_bot_warm;
 
     /* The sky is driven by the sun's *elevation*, modelled as a continuous
      * curve over the whole day rather than fixed sunrise/sunset windows.
@@ -1388,10 +1472,16 @@ static sky_t sky_for_kind(weather_kind_t kind)
     int sr, ss;
     sun_events(&sr, &ss);
 
-    /* Explicit night kinds force the night palette regardless of the
-     * wall-clock minute (e.g. a CLEAR_NIGHT debug scene at noon should still
-     * render a night sky, not a daytime blue). */
-    if (kind == WEATHER_CLEAR_NIGHT || kind == WEATHER_PARTLY_CLOUDY_NIGHT) {
+    /* Explicit night kinds force the flat night palette ONLY when the wall
+     * clock isn't synced — that's the debug case (a CLEAR_NIGHT scene shown at
+     * an arbitrary uptime minute should still look like night, not daytime
+     * blue). With a real clock we instead fall through to clear_sky_palette()
+     * below, whose night branch ramps twilight→night over the civil-twilight
+     * band. Otherwise the day→night kind switch at sunset snapped straight to
+     * the flat night colours with no dusk gradient. */
+    bool clock_synced = (time(NULL) > 1700000000);
+    if (!clock_synced &&
+        (kind == WEATHER_CLEAR_NIGHT || kind == WEATHER_PARTLY_CLOUDY_NIGHT)) {
         return (sky_t){ "night", {8, 12, 28}, {20, 20, 42} };
     }
 
@@ -1507,14 +1597,15 @@ static void draw_day_sky_depth(void)
         uint8_t a = smooth_u8(1.0f - d, 42);
         if (!a) continue;
         uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
-        /* After fill_gradient the sky colour is constant across each row, and
-         * the zenith tint + alpha are also constant per row, so the blended
-         * result is one colour for the whole row. Compute it once and fill
-         * flat instead of calling blend565 for all 800 px — the per-pixel
-         * version cost ~29 ms (one of the freeze contributors). */
-        uint16_t blended = blend565(row[0], zenith, a);
-        for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
-            row[x] = blended;
+        if (s_luminary_pos.warmth > 0.01f) {
+            for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
+                row[x] = blend565(row[x], zenith, a);
+            }
+        } else {
+            uint16_t blended = blend565(row[0], zenith, a);
+            for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
+                row[x] = blended;
+            }
         }
     }
 }
@@ -2219,9 +2310,140 @@ static float arc_progress(int rise, int set, int now_min)
 
 static float sun_curve(float progress)
 {
-    /* 0 at sunrise/sunset, 1 near solar noon. */
-    if (progress <= 0.0f || progress >= 1.0f) return 0.0f;
+    /* Continuous sin arc: 0 at sunrise/sunset (progress 0/1), 1 at noon,
+     * negative below the horizon when progress is outside [0,1] (glide zones). */
     return sinf(progress * 3.1415926f);
+}
+
+static float set_glide_minutes(void)
+{
+    float half_tw = civil_twilight_minutes() * 0.5f;
+    if (half_tw > SET_GLIDE_MIN) half_tw = SET_GLIDE_MIN;
+    if (half_tw < 10.0f) half_tw = 10.0f;
+    return half_tw;
+}
+
+static float sun_apex_y_seasonal(void)
+{
+    float decl = solar_declination_deg();
+    float noon_alt = 90.0f - fabsf(EVA_OBSERVER_LAT_DEG - decl);
+    const float ALT_MIN = 17.0f;
+    const float ALT_MAX = 65.0f;
+    float t = (noon_alt - ALT_MIN) / (ALT_MAX - ALT_MIN);
+    if (t < 0.0f) t = 0.0f;
+    else if (t > 1.0f) t = 1.0f;
+    return SUN_APEX_Y_WINTER - t * (SUN_APEX_Y_WINTER - SUN_APEX_Y_SUMMER);
+}
+
+/* Arc progress with ±glide extension so the luminary can sink below the
+ * screen edge instead of popping off at the horizon. Returns -999 if hidden. */
+static float arc_progress_glide(int rise, int set, int now_min, float glide_min)
+{
+    if (rise < 0 || set < 0) return -999.0f;
+    int duration = set - rise;
+    if (duration <= 0) duration += 1440;
+    int glide_i = (int)(glide_min + 0.5f);
+
+    int elapsed = now_min - rise;
+    if (set < rise) {
+        if (now_min >= rise) {
+            /* evening after rise */
+        } else if (now_min <= set) {
+            elapsed = now_min - rise + 1440;
+        } else {
+            int past_set = now_min - set;
+            if (past_set <= glide_i) {
+                elapsed = duration + past_set;
+            } else {
+                int before_rise = rise - now_min;
+                if (before_rise <= glide_i) {
+                    elapsed = -before_rise;
+                } else {
+                    return -999.0f;
+                }
+            }
+        }
+    } else if (elapsed < -glide_i || elapsed > duration + glide_i) {
+        return -999.0f;
+    }
+
+    if (elapsed < -glide_i || elapsed > duration + glide_i) {
+        return -999.0f;
+    }
+    return (float)elapsed / (float)duration;
+}
+
+static void luminary_pos_from_progress(float progress, float apex_y, luminary_pos_t *out)
+{
+    float arc = sun_curve(progress);
+    out->elevation = arc;
+    out->x_n = 0.06f + progress * 0.88f;
+    out->y_n = SUN_HORIZON_Y - arc * (SUN_HORIZON_Y - apex_y);
+    if (arc <= 0.0f) {
+        out->warmth = 0.0f;
+    } else {
+        float horizon = 1.0f - arc;
+        out->warmth = horizon * horizon * 0.82f;
+    }
+}
+
+static void compute_luminary_pos(int m, luminary_pos_t *out)
+{
+    out->x_n = 0.5f;
+    out->y_n = SUN_HORIZON_Y;
+    out->elevation = -1.0f;
+    out->warmth = 0.0f;
+    out->valid = false;
+
+    float glide = set_glide_minutes();
+    float apex_y = sun_apex_y_seasonal();
+
+    if (is_night_kind(s_kind)) {
+        float progress;
+        if (s_moonrise_min < 0 || s_moonset_min < 0) {
+            progress = 0.5f;
+            out->valid = true;
+        } else {
+            progress = arc_progress_glide(s_moonrise_min, s_moonset_min, m, glide);
+            if (progress <= -900.0f) {
+                return;
+            }
+            out->valid = true;
+        }
+        luminary_pos_from_progress(progress, apex_y, out);
+        out->warmth = 0.0f;
+        return;
+    }
+
+    int sr, ss;
+    sun_events(&sr, &ss);
+    float daylight = (float)(ss - sr);
+    if (daylight <= 1.0f) daylight = 12.0f * 60.0f;
+
+    /* Only show a fixed "believable daytime sun" when the wall clock is NOT
+     * yet synced — otherwise we'd have no real time to place it by. Once the
+     * clock is real, a *_DAY scene kind (e.g. open-meteo's is_day lagging the
+     * actual sunset) must NOT pin the sun to mid-sky: follow the real time so
+     * it sinks below the horizon after sunset like any other day. */
+    bool clock_synced = (time(NULL) > 1700000000);
+    bool forced_day = (s_kind == WEATHER_CLEAR_DAY || s_kind == WEATHER_PARTLY_CLOUDY_DAY);
+    bool show_unsynced_sun = forced_day && !clock_synced;
+
+    int glide_i = (int)(glide + 0.5f);
+    bool in_window = (m >= sr - glide_i && m <= ss + glide_i);
+    if (!in_window && !show_unsynced_sun) {
+        return;   /* below the horizon (past the glide tails) — hide the sun */
+    }
+
+    float progress;
+    if (show_unsynced_sun && (m < sr || m >= ss)) {
+        progress = 0.46f;   /* clock unsynced: park a plausible daytime sun */
+    } else {
+        progress = (float)(m - sr) / daylight;
+    }
+
+    out->valid = true;
+    luminary_pos_from_progress(progress, apex_y, out);
 }
 
 /* Total sky cover in [0..1], modelling each layer as an independent
@@ -2245,8 +2467,6 @@ static void draw_sun_or_moon(float t)
     s_sun_x = -1;
     s_sun_y = -1;
     s_sun_r = 0;
-
-    int m = minutes_now();
 
     /* Any precipitation kind hides the sun/moon: if it's raining, sleeting,
      * snowing or hailing the sky is overcast enough that no luminary shows
@@ -2290,69 +2510,24 @@ static void draw_sun_or_moon(float t)
     float vis = vis_raw * vis_raw * (3.0f - 2.0f * vis_raw);
 
     if (is_night_kind(s_kind)) {
-        /* Default hardcoded position if moon astronomy isn't available yet. */
-        float mx = 0.82f, my = 0.22f;
-        float progress = arc_progress(s_moonrise_min, s_moonset_min, m);
-        if (progress >= 0.0f) {
-            float angle = progress * 3.1415926f;
-            mx = 0.50f + sinf(angle - 1.5707963f) * 0.40f;
-            my = 0.30f - sinf(angle) * 0.16f;
-        }
-        int moon_x = (int)(EVA_WEATHER_RENDER_W * mx);
-        int moon_y = (int)(EVA_WEATHER_RENDER_H * my);
-        /* Moon doesn't have a sun-like halo, just the disc — but we still
-         * scale its visibility by cloud cover for partly-cloudy nights. */
-        /* Moon disc alpha = FIB_233 baseline (close to old 230), scaled by
-         * vis. The shadow disc that carves the lit fraction is FIB_233 +
-         * FIB_8 ≈ 241. Cutoff at FIB_13 (13) — below this the silhouette
-         * is invisible anyway, skip the draws. */
+        if (!s_luminary_pos.valid) return;
+        int moon_x = (int)(EVA_WEATHER_RENDER_W * s_luminary_pos.x_n);
+        int moon_y = (int)(EVA_WEATHER_RENDER_H * s_luminary_pos.y_n);
         uint8_t alpha_moon = (uint8_t)((float)FIB_233 * vis);
         if (alpha_moon < FIB_13) return;
         uint16_t moon_col = rgb565(245, 244, 225);
-        /* Moon radius doubled to match the 2× sun (the moon used to look
-         * tiny against the bigger sun and the native 800×480 canvas).
-         * Was FIB_21 + FIB_8 = 29, now ~58. */
         const int moon_r = (FIB_21 + FIB_8) * 2;
-        /* Single-pass lit-only renderer — only the illuminated fraction is
-         * painted. The dark side stays transparent, so no shadow disc ever
-         * bleeds outside the moon silhouette into the surrounding sky. */
         draw_moon_phase(moon_x, moon_y, moon_r, moon_col, alpha_moon);
         return;
     }
 
-    /* Day path: show the sun only while it is above the horizon, so it
-     * naturally rises from the left, peaks near noon, then drops away on
-     * the right instead of lingering as a fixed sprite after sunset. */
-    int sr, ss;
-    sun_events(&sr, &ss);
-    bool forced_day = (s_kind == WEATHER_CLEAR_DAY || s_kind == WEATHER_PARTLY_CLOUDY_DAY);
-    if ((m < sr || m >= ss) && !forced_day) return;   /* below the horizon */
+    if (!s_luminary_pos.valid) return;
 
-    float daylight = (float)(ss - sr);
-    if (daylight <= 1.0f) daylight = 12.0f * 60.0f;
-    float progress = (float)(m - sr) / daylight;
-    if (forced_day && (m < sr || m >= ss)) {
-        progress = 0.46f;   /* debug/unsynced clock: show a believable daytime sun */
-    }
-    if (progress < 0.0f) progress = 0.0f;
-    if (progress > 1.0f) progress = 1.0f;
-    float arc = sun_curve(progress);
-    float horizon_boost = 1.0f - arc;  /* bigger and warmer near horizon */
-    s_sun_elevation = arc;             /* publish for cloud-tint lighting */
-    /* Sun follows a real arc: rises FROM the horizon (bottom of screen) at
-     * dawn, climbs to its apex near solar noon, then sinks back to the
-     * horizon at dusk. The bottom of the screen is the horizon line.
-     *   arc = 0 (sunrise/sunset) → sun_y_n = SUN_HORIZON_Y (low, near bottom)
-     *   arc = 1 (solar noon)     → sun_y_n = SUN_APEX_Y    (high, near top)
-     * X still sweeps left→right across the day. */
-    const float SUN_HORIZON_Y = 0.90f;   /* just above the haze at the bottom */
-    const float SUN_APEX_Y    = 0.12f;   /* highest point at noon */
-    float sun_x_n = 0.06f + progress * 0.88f;
-    float sun_y_n = SUN_HORIZON_Y - arc * (SUN_HORIZON_Y - SUN_APEX_Y);
-    int sun_x = (int)(EVA_WEATHER_RENDER_W * sun_x_n);
-    int sun_y = (int)(EVA_WEATHER_RENDER_H * sun_y_n);
-    /* Disc + glow on the Fibonacci ladder, 2× former size:
-     * disc FIB_34+FIB_8=42 px (was FIB_21), halo steps 55→89→144 px. */
+    float arc = s_luminary_pos.elevation;
+    float horizon_boost = (arc > 0.0f) ? (1.0f - arc) : 0.0f;
+    s_sun_elevation = arc;
+    int sun_x = (int)(EVA_WEATHER_RENDER_W * s_luminary_pos.x_n);
+    int sun_y = (int)(EVA_WEATHER_RENDER_H * s_luminary_pos.y_n);
     const int r = FIB_34 + FIB_8;
     uint8_t a_outer  = (uint8_t)((float)FIB_34 * vis * (0.65f + 0.35f * horizon_boost));
     uint8_t a_corona = (uint8_t)((float)FIB_55 * vis * (0.75f + 0.25f * horizon_boost));
@@ -3364,43 +3539,178 @@ static void update_and_draw_particles(float dt, float t)
     }
 }
 
+/* Real CG lightning: stepped leader channel + 3–4 return-stroke flickers (~40 ms
+ * apart). We reuse one tortuous path (dart leaders follow the same channel).
+ * Intracloud "sheet" flashes omit the visible bolt ~22% of strikes. */
+static void generate_lightning_bolt(void)
+{
+    const int w = EVA_WEATHER_RENDER_W;
+    const int h = EVA_WEATHER_RENDER_H;
+
+    s_lightning_sheet_only = (rndf(0.0f, 1.0f) < 0.22f);
+
+    float sx = w * rndf(0.22f, 0.78f);
+    float sy = h * rndf(0.08f, 0.26f);   /* cloud base, not screen top */
+    float ex = sx + rndf(-w * 0.14f, w * 0.14f);
+    float ey = h * rndf(0.58f, 0.84f);
+
+    s_lightning_pt_count = LIGHTNING_PT_MAX;
+    for (int i = 0; i < LIGHTNING_PT_MAX; ++i) {
+        float u = (float)i / (float)(LIGHTNING_PT_MAX - 1);
+        float px = sx + (ex - sx) * u;
+        float py = sy + (ey - sy) * u;
+        if (i > 0 && i < LIGHTNING_PT_MAX - 1) {
+            /* Jitter shrinks toward the ground — dielectric-breakdown feel. */
+            float amp = ((1.0f - u) * (float)FIB_55 + (float)FIB_13) * 0.85f;
+            px += rndf(-amp, amp);
+            py += rndf(-amp * 0.28f, amp * 0.32f);
+        }
+        if (px < 2.0f) px = 2.0f;
+        if (px > (float)(w - 3)) px = (float)(w - 3);
+        if (py < 2.0f) py = 2.0f;
+        if (py > (float)(h - 3)) py = (float)(h - 3);
+        s_lightning_x[i] = (int16_t)px;
+        s_lightning_y[i] = (int16_t)py;
+    }
+
+    s_lightning_has_branch = false;
+    s_lightning_branch_pts = 0;
+    if (!s_lightning_sheet_only && rndf(0.0f, 1.0f) < 0.58f) {
+        int fork = (int)rndf(3.0f, (float)(LIGHTNING_PT_MAX - 5));
+        float bx = (float)s_lightning_x[fork];
+        float by = (float)s_lightning_y[fork];
+        float dir = rndf(-1.2f, 1.2f);
+        s_lightning_branch_pts = 4;
+        for (int j = 0; j < s_lightning_branch_pts; ++j) {
+            float t = (float)(j + 1) / (float)s_lightning_branch_pts;
+            bx += dir * rndf(10.0f, 26.0f);
+            by += rndf(14.0f, 34.0f);
+            if (bx < 2.0f) bx = 2.0f;
+            if (bx > (float)(w - 3)) bx = (float)(w - 3);
+            if (by > (float)(h - 3)) by = (float)(h - 3);
+            s_lightning_bx[j] = (int16_t)bx;
+            s_lightning_by[j] = (int16_t)by;
+            dir += rndf(-0.55f, 0.55f);
+            (void)t;
+        }
+        s_lightning_has_branch = true;
+    }
+}
+
+static void start_lightning_strike(float t)
+{
+    (void)t;
+    generate_lightning_bolt();
+    s_lightning_active = true;
+    s_lightning_pulse_idx = 0;
+    s_lightning_pulse_frame = 0;
+    s_lightning_peak = (float)(FIB_144 + FIB_34) + rndf(0.0f, (float)FIB_34);
+    s_lightning_alpha = s_lightning_peak;
+}
+
+static void schedule_next_lightning_strike(float t)
+{
+    float lo = (s_kind == WEATHER_HAIL) ? 2.2f : 3.5f;
+    float hi = (s_kind == WEATHER_HAIL) ? 7.5f : 12.0f;
+    s_lightning_next_strike_at = t + rndf(lo, hi);
+}
+
+static void draw_lightning_path(const int16_t *xs, const int16_t *ys, int pts,
+                                uint16_t core, uint16_t glow, uint8_t alpha)
+{
+    if (pts < 2 || alpha < FIB_2) return;
+    uint8_t glow_a = clamp_u8((int)((alpha * (int)FIB_144) / 255));
+    uint8_t core_a = clamp_u8((int)alpha + FIB_21);
+    for (int i = 1; i < pts; ++i) {
+        draw_line(xs[i - 1], ys[i - 1], xs[i], ys[i], glow, glow_a, 2);
+    }
+    for (int i = 1; i < pts; ++i) {
+        draw_line(xs[i - 1], ys[i - 1], xs[i], ys[i], core, core_a, 1);
+    }
+}
+
+static void composite_lightning_flash(uint8_t alpha)
+{
+    if (alpha < FIB_2) return;
+
+    uint16_t cool = rgb565(196, 214, 255);
+    uint16_t warm = rgb565(255, 250, 242);
+    int cx = s_lightning_x[0];
+    int cy = s_lightning_y[0];
+
+    /* Cloud-body illumination — brightest near the channel origin. */
+    draw_filled_circle(cx, cy, FIB_144, cool, clamp_u8((alpha * FIB_34) / 255));
+    draw_filled_circle(cx, cy, FIB_89, warm, clamp_u8((alpha * FIB_55) / 255));
+
+    if (!s_lightning_sheet_only) {
+        for (int i = 0; i < s_lightning_pt_count; i += 2) {
+            int r = FIB_34 + (i >> 1) * FIB_3;
+            if (r > FIB_55) r = FIB_55;
+            uint8_t a = clamp_u8((alpha * (200 - i * FIB_8)) / 255);
+            draw_filled_circle(s_lightning_x[i], s_lightning_y[i], r, cool, a);
+        }
+    }
+
+    /* Upper-sky wash — stronger at the top, mimics cloud volume lighting. */
+    uint8_t sky_a = clamp_u8((alpha * FIB_21) / 255);
+    if (sky_a >= FIB_2) {
+        int y1 = (int)((float)EVA_WEATHER_RENDER_H * 0.62f);
+        for (int y = 0; y < y1; y += 3) {
+            uint8_t row_a = (uint8_t)((sky_a * (y1 - y)) / (y1 + 1));
+            if (row_a < FIB_2) continue;
+            uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
+            for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 3) {
+                row[x] = blend565(row[x], warm, row_a);
+            }
+        }
+    }
+}
+
 /* Lightning has two phases:
- *   1. update_lightning(t)         — triggers new strikes, picks bolt segment
- *                                    endpoints in working-buffer coordinates,
- *                                    and decays alpha.
- *   2. composite_lightning_on_render() — paints flash + bolt into the working
- *                                    buffer. LVGL scales the final canvas 2x,
- *                                    which is cheaper than rewriting a full
- *                                    800x480 buffer here every frame.
+ *   1. update_lightning(t)         — schedules strikes, runs multi-pulse
+ *                                    return-stroke flicker (~40 ms apart).
+ *   2. composite_lightning_on_render() — regional cloud flash + bolt path.
  */
 static void update_lightning(float t)
 {
     if (s_kind != WEATHER_THUNDERSTORM && s_kind != WEATHER_HAIL) {
         s_lightning_alpha = 0.0f;
-        s_lightning_cooldown = 0;
+        s_lightning_active = false;
+        s_lightning_next_strike_at = 0.0f;
         return;
     }
-    float p = sinf(t * 2.5f) * sinf(t * 5.3f) * sinf(t * 7.1f);
-    float trigger = (s_kind == WEATHER_HAIL) ? 0.66f : 0.58f;
-    if (s_lightning_cooldown > 0) {
-        s_lightning_cooldown--;
-    } else if (p > trigger && s_lightning_alpha < (float)FIB_5) {
-        /* Initial lightning brightness: FIB_144 + FIB_34 = 178 baseline plus
-         * up to FIB_55 jitter — that gives a flash alpha in 178..233 (uint8
-         * range cap is 255, so we stay just below saturation). Decay below
-         * uses EVA_INV_PHI² (1/φ² ≈ 0.382) per frame — already Fibonacci. */
-        s_lightning_alpha = (float)(FIB_144 + FIB_34) + rndf(0.0f, (float)FIB_55);
-        /* Lightning re-trigger cooldown = FIB_8 frames (~104 ms at 77 Hz). */
-        s_lightning_cooldown = FIB_8;
-        s_lightning_x[0] = (int16_t)(EVA_WEATHER_RENDER_W * rndf(0.38f, 0.68f));
-        s_lightning_y[0] = 0;
-        for (int i = 1; i < 6; ++i) {
-            s_lightning_x[i] = (int16_t)(s_lightning_x[i - 1] + (int)rndf(-42.0f, 42.0f));
-            s_lightning_y[i] = (int16_t)(s_lightning_y[i - 1] + (int)rndf(28.0f, 68.0f));
-        }
+
+    if (s_lightning_next_strike_at <= 0.0f) {
+        schedule_next_lightning_strike(t);
     }
-    if (s_lightning_alpha >= 2.0f) {
-        s_lightning_alpha *= EVA_INV_PHI * EVA_INV_PHI;
+
+    static const float pulse_k[4] = {
+        1.00f,
+        (float)FIB_55 / (float)FIB_89,
+        (float)FIB_34 / (float)FIB_89,
+        (float)FIB_21 / (float)FIB_89,
+    };
+
+    if (s_lightning_active) {
+        s_lightning_pulse_frame++;
+        if (s_lightning_pulse_frame <= FIB_2) {
+            s_lightning_alpha = s_lightning_peak * pulse_k[s_lightning_pulse_idx];
+        } else if (s_lightning_pulse_frame == FIB_3) {
+            s_lightning_alpha = s_lightning_peak * 0.05f;
+        } else {
+            s_lightning_pulse_frame = 0;
+            s_lightning_pulse_idx++;
+            if (s_lightning_pulse_idx >= 4) {
+                s_lightning_active = false;
+                s_lightning_alpha = 0.0f;
+                schedule_next_lightning_strike(t);
+            }
+        }
+        return;
+    }
+
+    if (t >= s_lightning_next_strike_at) {
+        start_lightning_strike(t);
     }
 }
 
@@ -3408,26 +3718,18 @@ static void composite_lightning_on_render(void)
 {
     if (s_lightning_alpha < 2.0f) return;
     uint8_t alpha = clamp_u8((int)s_lightning_alpha);
-    uint16_t white = rgb565(255, 255, 255);
-    for (int y = 0; y < EVA_WEATHER_RENDER_H; ++y) {
-        uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
-        for (int x = y & 1; x < EVA_WEATHER_RENDER_W; x += 2) {
-            if (alpha >= 240) {
-                row[x] = white;
-            } else {
-                row[x] = blend565(row[x], white, alpha);
-            }
-        }
-    }
-    uint16_t bolt = rgb565(238, 246, 255);
-    /* Bolt is FIB_5 segments (5 = original 6 segments minus the start vertex
-     * that connects to the previous). +FIB_34 extra brightness over the
-     * full-screen flash so the bolt itself is always brighter than the
-     * background flash, capped at uint8 max via clamp_u8. */
-    for (int i = 1; i < FIB_5 + 1; ++i) {
-        draw_line(s_lightning_x[i - 1], s_lightning_y[i - 1],
-                  s_lightning_x[i], s_lightning_y[i],
-                  bolt, clamp_u8(alpha + FIB_34), 1);
+
+    composite_lightning_flash(alpha);
+
+    if (s_lightning_sheet_only) return;
+
+    uint16_t core = rgb565(245, 252, 255);
+    uint16_t glow = rgb565(176, 204, 255);
+    draw_lightning_path(s_lightning_x, s_lightning_y, s_lightning_pt_count,
+                        core, glow, alpha);
+    if (s_lightning_has_branch) {
+        draw_lightning_path(s_lightning_bx, s_lightning_by, s_lightning_branch_pts,
+                            core, glow, clamp_u8((alpha * FIB_89) / 255));
     }
 }
 
@@ -3830,6 +4132,9 @@ static void render_weather(float dt)
     if (s_kind != s_prev_kind) {
         reset_particles_for_kind();
         reset_glass_overlay_for_kind();
+        s_lightning_active = false;
+        s_lightning_alpha = 0.0f;
+        s_lightning_next_strike_at = 0.0f;
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
         s_prev_kind = s_kind;
@@ -3843,7 +4148,10 @@ static void render_weather(float dt)
     bool sky_refreshed = false;
     if (!s_bg_buf || s_bg_ttl == 0) {
         sky_t sky = sky_for_kind(s_kind);
-        fill_gradient(sky.top, sky.bottom);
+        int m = minutes_now();
+        compute_luminary_pos(m, &s_luminary_pos);
+        fill_sky(sky.top, sky.bottom,
+                 s_luminary_pos.x_n, s_luminary_pos.y_n, s_luminary_pos.warmth);
         draw_day_sky_depth();
         draw_sun_or_moon(t);
         if (s_bg_buf) {

@@ -454,6 +454,10 @@ static void weather_update_cb(const weather_state_t *st, void *user)
      * running in the background and will resume driving the UI as soon as
      * test mode is turned off. */
     if (s_test_mode) return;
+    /* Feed sun times to the clock so the backlight ramp tracks the real day. */
+    if (s_clock) {
+        eva_clock_set_sun_times(s_clock, st->sunrise_min, st->sunset_min);
+    }
     update_weather_labels(st);
     eva_weather_canvas_set_weather(st);
     eva_weather_canvas_show(true);

@@ -14,8 +14,11 @@ Think of it as looking through a window at the weather outside.
 - **Weather description** in the lower band (Ukrainian-capable `eva_font_uk_22`)
 
 **Sky & sun**
-- Vertical gradient sky with daypart palettes (morning / day / evening / night)
-- Sun or moon follows a day arc: low at sunrise/sunset, high near solar noon
+- **Radial sky gradient** centred on the sun: warm light pools around the sun's azimuth over a vertical horizon-biased base, instead of flat horizontal bands
+- **Smooth day↔night transition**: the palette ramps twilight→night over the real civil-twilight window (longer in summer), so dusk fades gradually instead of snapping to a flat night colour at sunset
+- Sun or moon follows a day arc: low at sunrise/sunset, high near solar noon, with a **seasonal apex** (lower in winter, higher in summer)
+- After sunset the sun **sinks below the bottom edge** through a short glide window and rises back at dawn, rather than popping off at the horizon
+- **Sunset colour tracks cloud cover** (vivid orange when clear, muted grey when overcast) and shifts subtly by day-of-year (redder winter dusks, more golden in summer)
 - Sun disc and glow use **Fibonacci radii** (42 px disc, rings at 55 / 89 / 144 px)
 - A **per-frame animated halo** breathes on outer rings (89 / 144 / 233 px) with eight slow soft rays
 
@@ -74,6 +77,8 @@ Removed for stability/FPS: full-screen sky glare scan and heavy static god-ray p
 - Uses the ESP32-C6 as hosted Wi-Fi through `esp_hosted`.
 - Fetches weather from Open-Meteo and Clear Outside.
 - Syncs time over HTTP Date headers instead of SNTP, because SNTP was unstable on this hosted Wi-Fi stack.
+- **Reconnects Wi-Fi indefinitely with exponential backoff** (fast retries first, then 2→60 s) so the display recovers on its own when the AP comes back, instead of giving up after a fixed retry count.
+- **Ramps the backlight by the real sun times**: full brightness by day, easing down to 10 % over the 3 hours after sunset, holding through the night, and back to 100 % over the hour before sunrise (falls back to a fixed `[01:00, 06:00)` dim schedule until time syncs).
 - Stores timezone and last weather state in NVS.
 - Exposes a TinyUSB CDC console for status, testing, screenshots, and manual weather overrides.
 - Includes the board support components and tuned `sdkconfig.defaults` needed for this hardware.
@@ -305,7 +310,8 @@ wind clear
 | `main/main.c` | App entry, CDC command handling, test panel. |
 | `main/eva_weather_canvas.c` | Procedural renderer: sky, clouds, sun, particles, text, glass. |
 | `main/eva_font_clock_288_extralight.c` | 288 px clock font (Manrope ExtraLight). |
-| `main/eva_wifi.c` | Hosted Wi-Fi setup and HTTP time sync. |
+| `main/eva_wifi.c` | Hosted Wi-Fi setup, backoff reconnect, and HTTP time sync. |
+| `main/eva_clock.c` | Clock task: time/date strings + sun-driven backlight ramp. |
 | `main/weather_fetch.c` | Dual-source weather coordinator. |
 | `main/weather_fetch_openmeteo.c` | Open-Meteo API provider. |
 | `main/weather_fetch_clearoutside.c` | Clear Outside HTML provider. |
