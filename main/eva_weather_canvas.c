@@ -2459,6 +2459,16 @@ static void compute_luminary_pos(int m, luminary_pos_t *out)
     out->warmth = 0.0f;
     out->valid = false;
 
+    /* Precipitation scenes hide the sun/moon disc entirely (see
+     * draw_sun_or_moon), so there is no luminary to place and no warm glow to
+     * pool around it — an overcast rainy sky has no visible sun. Leaving
+     * warmth=0 here keeps fill_sky() on its cheap flat-fill path instead of the
+     * per-pixel radial blend, which was rebaking ~11 ms every background hold
+     * and causing the once-a-second hitch in rain-with-clouds. */
+    if (weather_kind_has_precip_particles(s_kind)) {
+        return;   /* valid=false, warmth=0: flat sky, no disc */
+    }
+
     float glide = set_glide_minutes();
     float apex_y = sun_apex_y_seasonal();
 
