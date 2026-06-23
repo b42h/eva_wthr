@@ -292,6 +292,12 @@ typedef struct {
 } luminary_pos_t;
 static luminary_pos_t s_luminary_pos;
 
+/* Horizon-band sky colour from the last bg-cache pass. Rain streaks tint
+ * themselves from this so the drops read as the actual sky refracted through
+ * water — cool grey-blue by day, near-black at night — instead of a fixed
+ * bright white that looked unreal against a dark storm sky. */
+static rgb_t s_sky_bottom = {96, 108, 118};
+
 #define SUN_HORIZON_Y      0.90f
 #define SUN_APEX_Y_SUMMER  0.12f
 #define SUN_APEX_Y_WINTER  0.35f
@@ -3514,6 +3520,19 @@ static void compose_clouds_into_working_buffer(float dt)
 static void update_and_draw_particles(float dt, float t)
 {
     ensure_particle_count();
+
+    /* Rain streak colour = the horizon sky lifted ~40 % toward white. A drop is
+     * a lens showing a brighter slice of the sky behind it, so it tracks the
+     * scene: pale steel-blue under a grey storm, near-charcoal at night. Cheaper
+     * and more believable than the old fixed rgb565(214,234,255) that glowed
+     * white against a dark sky. Computed once per frame, not per particle. */
+    rgb_t rain_rgb = {
+        .r = (uint8_t)(s_sky_bottom.r + (255 - s_sky_bottom.r) * 40 / 100),
+        .g = (uint8_t)(s_sky_bottom.g + (255 - s_sky_bottom.g) * 40 / 100),
+        .b = (uint8_t)(s_sky_bottom.b + (255 - s_sky_bottom.b) * 40 / 100),
+    };
+    uint16_t rain_col = rgb565_from(rain_rgb);
+
     for (uint16_t i = 0; i < s_target && i < PARTICLE_MAX; ++i) {
         particle_t *p = &s_particles[i];
         switch (p->kind) {
@@ -3527,7 +3546,9 @@ static void update_and_draw_particles(float dt, float t)
                 p->x < -80.0f || p->x > EVA_WEATHER_RENDER_W + 80.0f) {
                 spawn_particle(p, P_RAIN, true, i);
             }
-            uint8_t alpha = clamp_u8((int)(p->alpha * 200.0f));
+            /* Lower peak alpha (was 200) so streaks stay translucent — real
+             * rain is a faint veil, not opaque white lines. */
+            uint8_t alpha = clamp_u8((int)(p->alpha * 150.0f));
             int x0 = (int)p->x;
             int y0 = (int)p->y;
             /* Streak direction follows actual velocity, so wind from the
@@ -3539,9 +3560,9 @@ static void update_and_draw_particles(float dt, float t)
             int x1 = x0 - (int)(slen * (p->vx / vy_safe));
             int y1 = y0 - (int)slen;
             if (p->size > 14.0f) {
-                draw_line(x1, y1, x0, y0, rgb565(214, 234, 255), alpha, 1);
+                draw_line(x1, y1, x0, y0, rain_col, alpha, 1);
             } else {
-                draw_rain_streak(x1, y1, x0, y0, rgb565(214, 234, 255), alpha);
+                draw_rain_streak(x1, y1, x0, y0, rain_col, alpha);
             }
             break;
         }
@@ -4396,6 +4417,7 @@ static void render_weather(float dt)
     bool sky_refreshed = false;
     if (!s_bg_buf || s_bg_ttl == 0) {
         sky_t sky = sky_for_kind(s_kind);
+        s_sky_bottom = sky.bottom;   /* cache for sky-tinted rain streaks */
         int m = minutes_now();
         compute_luminary_pos(m, &s_luminary_pos);
         fill_sky(sky.top, sky.bottom,
