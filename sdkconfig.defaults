@@ -189,3 +189,15 @@ CONFIG_ESP32P4_REV_MIN_1=y
 # from PSRAM with no DMA acceleration. Keeping the legacy single-DPI mode
 # where the original 18 Hz baseline lived.
 CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
+
+# --- mbedTLS dynamic buffers (2026-06-29) ---
+# open-meteo is HTTPS; its TLS handshake needs a ~16 KB contiguous internal-RAM
+# buffer. With static buffers that block is held for the whole connection, and
+# after ~2 days of uptime internal heap fragmented below it → "esp-aes: Failed
+# to allocate memory", openmeteo stuck on retry, scene frozen on stale weather
+# (clearoutside, being plain HTTP, kept working). Dynamic buffers grow the TLS
+# I/O buffers on demand and free them between records, so the peak contiguous
+# requirement drops and survives fragmentation.
+# NOTE: DYNAMIC_BUFFER is mutually exclusive with SSL_VARIABLE_BUFFER_LENGTH
+# (Kconfig: depends on !MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH) — enable only this one.
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y

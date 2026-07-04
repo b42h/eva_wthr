@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "esp_lcd_types.h"
 #include "lvgl.h"
@@ -33,6 +34,16 @@ void eva_weather_canvas_set_desc_text(const char *text);
  * take the LVGL lock before reading it. */
 const uint16_t *eva_weather_canvas_display_buf(void);
 
+/* Force a lightning strike on the next frame (CDC "lightning" test command).
+ * Only fires while the active kind is THUNDERSTORM or HAIL — the lightning
+ * state machine is gated to those kinds. */
+void eva_weather_canvas_trigger_lightning(void);
+
+/* Copy a coherent frame into `dst` under the render lock — unlike reading
+ * display_buf() directly, this can never observe a half-painted frame.
+ * `dst_bytes` must be ≥ 800*480*2. Returns false if the canvas isn't up. */
+bool eva_weather_canvas_copy_display(uint16_t *dst, size_t dst_bytes);
+
 /* Last computed canvas tick rate in Hz. Updated alongside the FPS log line
  * (every LOG_EVERY_FRAMES ticks). Zero until the first window completes. */
 uint32_t eva_weather_canvas_last_tick_hz(void);
@@ -45,6 +56,7 @@ void eva_weather_canvas_last_breakdown_us(uint32_t *bg_us, uint32_t *cloud_us,
                                           uint32_t *particle_us, uint32_t *lightning_us,
                                           uint32_t *lvgl_us, uint32_t *vsync_us);
 void eva_weather_canvas_cloud_budget(uint16_t *active, uint16_t *max);
+void eva_weather_canvas_cloud_info(char *buf, size_t buf_len);
 
 /* Test-mode overrides. When non-negative, these values override the live
  * weather state. Pass -1 to clear the override and return to live values.

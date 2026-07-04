@@ -14,6 +14,10 @@ void eva_clock_set_hour_offset(eva_clock_t *self, int hours);
 void eva_clock_set_sun_times(eva_clock_t *self, int sunrise_min, int sunset_min);
 
 void eva_clock_tick(eva_clock_t *self);
+
+/* Last backlight percent pushed to the panel (-1 before the first apply).
+ * Diagnostic for the CDC status command. */
+int eva_clock_current_brightness(const eva_clock_t *self);
 const char *eva_clock_text(const eva_clock_t *self);
 
 #endif

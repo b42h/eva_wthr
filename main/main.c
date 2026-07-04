@@ -1673,21 +1673,19 @@ static void debug_weather_in_lvgl(void *user)
     if (kind == WEATHER_CLEAR_DAY || kind == WEATHER_CLEAR_NIGHT) {
         st.wind_kph = (int16_t)clamp_i((int)st.wind_kph + weatherdebug_rand_range(&seed, -3, 6), 0, 120);
     }
-    /* For night kinds, force sunrise/sunset so the current wall-clock time
-     * lands well outside any sunrise/sunset window — otherwise the sunset
-     * gradient (rose/lavender) will leak into a clear-night demo. Tuning the
-     * times to a wide AM band makes any debug call show a real night sky. */
-    if (kind == WEATHER_CLEAR_NIGHT || kind == WEATHER_PARTLY_CLOUDY_NIGHT) {
-        st.sunrise_min = 360;   /* 06:00 next-day */
-        st.sunset_min  = 1080;  /* 18:00 previous-day; both far from "now" */
-        /* Also fudge "now" via skipping the daytime sun draw — handled in
-         * sky_for_kind via is_night_kind, which already prioritises the
-         * kind tag. Nothing else to do here. */
+    /* Keep live sunrise/sunset from the cached fetch so sky twilight and
+     * day/night palette follow real local sun times (not fixed 06:00/18:00). */
+    if (st.sunrise_min < 0 || st.sunset_min < 0) {
+        const weather_state_t *live = eva_weather_get();
+        if (live) {
+            if (st.sunrise_min < 0) st.sunrise_min = live->sunrise_min;
+            if (st.sunset_min < 0)  st.sunset_min  = live->sunset_min;
+        }
     }
     snprintf(st.desc, sizeof(st.desc), "%s наживо", weather_kind_label_uk(kind));
     st.fetched_at = time(NULL);
-    eva_weather_set(&st);
-    eva_weather_canvas_set_kind(kind);
+    eva_weather_set_transient(&st);
+    eva_weather_canvas_set_weather(&st);
     eva_weather_canvas_show(true);
     update_weather_labels(&st);
 
@@ -1707,6 +1705,20 @@ static void debug_weather_in_lvgl(void *user)
         test_sync_controls_from_state();
         update_test_banner();
     }
+}
+
+static void restore_live_weather_and_time(void)
+{
+    weather_fetch_set_pinned(false);
+    s_test_hour_offset = 0;
+    if (s_clock) {
+        eva_clock_set_hour_offset(s_clock, 0);
+    }
+    eva_weather_canvas_set_time_offset(0);
+    eva_weather_canvas_clear_test_overrides();
+    eva_weather_discard_saved();
+    weather_fetch_reapply_cached();
+    weather_fetch_request();
 }
 
 static void wifi_status_cb(const char *msg)
@@ -1798,6 +1810,7 @@ static void cdc_send_weather_status(void)
         "  sun: %s\r\n"
         "  clock_solar: %s\r\n"
         "  tz: %s\r\n"
+        "  backlight: %d%%\r\n"
         "  log_level: %s\r\n"
         "  uptime_s: %llu\r\n"
         "  sources:\r\n"
@@ -1825,6 +1838,7 @@ static void cdc_send_weather_status(void)
         sun_buf,
         clock_solar_buf,
         eva_settings_get_tz(s_settings),
+        eva_clock_current_brightness(s_clock),
         log_level_to_str(esp_log_level_get("*")),
         (unsigned long long)(esp_timer_get_time() / 1000000ULL),
         om_str, weather_fetch_openmeteo_retrying()    ? " (retrying)" : "",
@@ -1872,6 +1886,7 @@ static void cdc_handle_command(void *user, char *line)
             "  tz\r\n"
             "  tz <posix-tz-string>\r\n"
             "  clockoffset <hours>\r\n"
+            "  weatherlive — real clock + live fetch (undoes debug/pin/offset)\r\n"
             "  weather\r\n"
             "  weather <" WEATHER_KIND_HELP "> <temp_c> \"Description\"\r\n"
             "  weather refresh\r\n"
@@ -1879,6 +1894,9 @@ static void cdc_handle_command(void *user, char *line)
             "  weatherdebug <" WEATHER_KIND_HELP "> <frame>\r\n"
             "  status\r\n"
             "  perf\r\n"
+            "  cloudinfo — cloud asset pool status\r\n"
+            "  lightning — force a strike (thunderstorm/hail only)\r\n"
+            "  weatherpin on|off — freeze the scene against live fetch\r\n"
             "  screenshot\r\n"
             "  log\r\n"
             "  log <none|error|warn|info|debug|verbose>\r\n");
@@ -1949,6 +1967,41 @@ static void cdc_handle_command(void *user, char *line)
         return;
     }
 
+    if (strcmp(cmd, "cloudinfo") == 0) {
+        char info[320];
+        eva_weather_canvas_cloud_info(info, sizeof info);
+        cdc_send(info);
+        return;
+    }
+
+    if (strcmp(cmd, "lightning") == 0) {
+        eva_weather_canvas_trigger_lightning();
+        cdc_send("OK lightning strike queued (fires only in thunderstorm/hail)\r\n");
+        return;
+    }
+
+    if (strcmp(cmd, "weatherlive") == 0) {
+        restore_live_weather_and_time();
+        cdc_send("OK weatherlive — unpinned, clock offset cleared, fetch queued\r\n");
+        return;
+    }
+
+    if (strncmp(cmd, "weatherpin", 10) == 0) {
+        char *value = trim_in_place(cmd + 10);
+        if (strcmp(value, "on") == 0) {
+            weather_fetch_set_pinned(true);
+            cdc_send("OK weather pinned — live fetch won't overwrite the scene\r\n");
+        } else if (strcmp(value, "off") == 0) {
+            weather_fetch_set_pinned(false);
+            weather_fetch_request();
+            cdc_send("OK weather unpinned — live fetch resumes\r\n");
+        } else {
+            cdc_sendf("weatherpin: %s (usage: weatherpin on|off)\r\n",
+                      weather_fetch_is_pinned() ? "on" : "off");
+        }
+        return;
+    }
+
     if (strcmp(cmd, "scene") == 0) {
         cdc_send("scene: weather\r\n");
         return;
@@ -2003,7 +2056,7 @@ static void cdc_handle_command(void *user, char *line)
         st.kind = WEATHER_UNKNOWN;
         st.desc[0] = '\0';
         st.fetched_at = time(NULL);
-        eva_weather_set(&st);
+        eva_weather_set_transient(&st);
         cdc_sendf("OK weatherraw clouds L/M/H/T=%u/%u/%u/%u fog=%u precip=%s %u.%umm\r\n",
                   (unsigned)st.cloud_low_pct, (unsigned)st.cloud_mid_pct,
                   (unsigned)st.cloud_high_pct, (unsigned)st.cloud_total_pct,
@@ -2068,7 +2121,7 @@ static void cdc_handle_command(void *user, char *line)
         st.temp_c = (int8_t)atoi(temp_s);
         st.fetched_at = time(NULL);
         strlcpy(st.desc, desc_s, sizeof(st.desc));
-        eva_weather_set(&st);
+        eva_weather_set_transient(&st);
         cdc_sendf("OK weather %s %+dC \"%s\"\r\n",
                   weather_kind_name(st.kind), (int)st.temp_c, st.desc);
         return;

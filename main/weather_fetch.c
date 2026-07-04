@@ -210,7 +210,26 @@ static void merge_and_apply(void)
     /* Ukrainian description from kind */
     snprintf(st.desc, sizeof(st.desc), "%s", weather_kind_label_uk(st.kind));
 
+    if (weather_fetch_is_pinned()) {
+        /* Demo/test pin (CDC `weatherpin on`): keep fetching in the
+         * background, but don't clobber the pinned scene. Live weather
+         * kept overwriting pinned demos mid-test (2026-07-03). */
+        ESP_LOGI(TAG, "weather pinned — fetched state not applied");
+        return;
+    }
     eva_weather_set(&st);
+}
+
+static volatile bool s_weather_pinned;
+
+void weather_fetch_set_pinned(bool pinned)
+{
+    s_weather_pinned = pinned;
+}
+
+bool weather_fetch_is_pinned(void)
+{
+    return s_weather_pinned;
 }
 
 /* Run one provider call; on success update s_last_*. On failure bump retry
@@ -345,6 +364,16 @@ void weather_fetch_request(void)
     if (!s_job_queue) return;
     queue_job(JOB_OPENMETEO);
     queue_job(JOB_CLEAROUTSIDE);
+}
+
+void weather_fetch_reapply_cached(void)
+{
+    if (!s_state_mutex) return;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    if (s_have_openmeteo || s_have_clearoutside) {
+        merge_and_apply();
+    }
+    xSemaphoreGive(s_state_mutex);
 }
 
 int64_t weather_fetch_openmeteo_last_ts(void)    { return s_last_ok_openmeteo; }

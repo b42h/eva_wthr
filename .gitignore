@@ -15,3 +15,11 @@ screenshots/
 !docs/images/*.jpg
 !docs/images/*.jpeg
 !docs/images/*.png
+
+# Generated cloud-mask artifacts (assets/clouds.bin IS committed; these are not)
+tools/cloudgen/out/
+tools/cloudgen/golden/
+tools/cloudgen/.venv/
+tools/cloudgen/__pycache__/
+tools/cloudgen/*.png
+*.ppm

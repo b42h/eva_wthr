@@ -109,13 +109,13 @@ esp_err_t eva_screenshot_capture(const uint8_t **out_ptr, size_t *out_size)
     }
 
     int64_t t0 = esp_timer_get_time();
-    const uint16_t *src = eva_weather_canvas_display_buf();
-    if (!src) {
+    if (!eva_weather_canvas_copy_display(
+            (uint16_t *)s_in_buf,
+            EVA_SCREENSHOT_W * EVA_SCREENSHOT_H * sizeof(uint16_t))) {
         ESP_LOGW(TAG, "no render buffer available");
         return ESP_ERR_INVALID_STATE;
     }
-    memcpy(s_in_buf, src, EVA_SCREENSHOT_W * EVA_SCREENSHOT_H * sizeof(uint16_t));
-    ESP_LOGD(TAG, "screenshot src: raw-weather");
+    ESP_LOGD(TAG, "screenshot src: raw-weather (locked copy)");
     int64_t t_copy = esp_timer_get_time() - t0;
 
     jpeg_encode_cfg_t enc = {

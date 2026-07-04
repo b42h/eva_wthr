@@ -238,6 +238,19 @@ static void restore_state(void)
     free(raw);
     s_weather = restored;
 
+    /* weatherdebug/weatherraw snapshots must not survive reboot — they were
+     * written before we split transient vs persisted sets, or by older builds. */
+    if (strstr(s_weather.desc, "наживо") != NULL) {
+        ESP_LOGW(TAG, "discarding debug weather snapshot from NVS");
+        s_weather = (weather_state_t){
+            .kind = WEATHER_UNKNOWN,
+            .desc = "Невідомо",
+            .sunrise_min = -1,
+            .sunset_min = -1,
+        };
+        return;
+    }
+
     /* Clamp anything that might be corrupt. */
     if (s_weather.kind < WEATHER_UNKNOWN || s_weather.kind >= WEATHER_KIND_COUNT) {
         s_weather.kind = WEATHER_UNKNOWN;
@@ -269,7 +282,7 @@ void eva_weather_set_update_cb(eva_weather_update_cb_t cb, void *user)
     s_update_user = user;
 }
 
-void eva_weather_set(const weather_state_t *st)
+static void weather_set_internal(const weather_state_t *st, bool persist)
 {
     if (!st || !s_weather_lock) return;
 
@@ -357,8 +370,11 @@ void eva_weather_set(const weather_state_t *st)
         xSemaphoreGive(s_weather_lock);
     }
 
-    persist_state(&copy);
-    ESP_LOGI(TAG, "set %s %+dC \"%s\" clouds L=%u/M=%u/H=%u tot=%u fog=%u precip=%s",
+    if (persist) {
+        persist_state(&copy);
+    }
+    ESP_LOGI(TAG, "%sset %s %+dC \"%s\" clouds L=%u/M=%u/H=%u tot=%u fog=%u precip=%s",
+             persist ? "" : "transient ",
              weather_kind_name(copy.kind), copy.temp_c, copy.desc,
              (unsigned)copy.cloud_low_pct, (unsigned)copy.cloud_mid_pct,
              (unsigned)copy.cloud_high_pct, (unsigned)copy.cloud_total_pct,
@@ -366,6 +382,28 @@ void eva_weather_set(const weather_state_t *st)
     if (s_update_cb) {
         s_update_cb(&copy, s_update_user);
     }
+}
+
+void eva_weather_set(const weather_state_t *st)
+{
+    weather_set_internal(st, true);
+}
+
+void eva_weather_set_transient(const weather_state_t *st)
+{
+    weather_set_internal(st, false);
+}
+
+void eva_weather_discard_saved(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("weather", NVS_READWRITE, &h) != ESP_OK) {
+        return;
+    }
+    (void)nvs_erase_key(h, "blob_v2");
+    (void)nvs_commit(h);
+    nvs_close(h);
+    ESP_LOGI(TAG, "NVS weather snapshot erased");
 }
 
 const weather_state_t *eva_weather_get(void)

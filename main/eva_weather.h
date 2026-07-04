@@ -101,6 +101,11 @@ typedef void (*eva_weather_update_cb_t)(const weather_state_t *st, void *user);
 void eva_weather_init(void);
 void eva_weather_set_update_cb(eva_weather_update_cb_t cb, void *user);
 void eva_weather_set(const weather_state_t *st);
+/* CDC debug/manual overrides — RAM + canvas only, not written to NVS. */
+void eva_weather_set_transient(const weather_state_t *st);
+/* Drop the NVS weather snapshot (e.g. after weatherdebug). Next boot waits
+ * for fetch instead of restoring a pinned demo scene. */
+void eva_weather_discard_saved(void);
 const weather_state_t *eva_weather_get(void);
 bool eva_weather_copy(weather_state_t *out);
 

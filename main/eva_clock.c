@@ -245,6 +245,11 @@ static void apply_brightness_schedule(eva_clock_t *self, int minute_of_day)
     self->cur_brightness = target;
 }
 
+int eva_clock_current_brightness(const eva_clock_t *self)
+{
+    return self ? self->cur_brightness : -1;
+}
+
 /* Current local minute-of-day (0..1439) using the same time source as
  * eva_clock_tick (real time once synced, uptime fallback otherwise), including
  * the test hour-offset. */
