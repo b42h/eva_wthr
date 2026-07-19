@@ -190,16 +190,25 @@ def test_ray_sprite_phases():
 
 def test_moon_phases_monotonic():
     import sprites
-    lit_prev = -1
-    for ph in range(8):
+    n = sprites.MOON_PHASE_COUNT
+    # The terminator now gates the ALPHA plane (shadow side transparent, not
+    # black), so the VISIBLE (alpha) area is what grows with phase.
+    vis_prev = -1
+    for ph in range(n):
         alpha, lum = sprites.gen_moon(phase=ph)
         assert alpha.shape == (120, 120) and lum.shape == (120, 120)
-        lit = int((lum > 60).sum())
-        assert lit > lit_prev, f"phase {ph}: lit area must grow"
-        lit_prev = lit
-    # Full moon shows crater texture: luminance variance inside the disc.
-    inside = alpha > 128
-    assert lum[inside].std() > 8, "craters missing"
+        vis = int((alpha > 60).sum())
+        assert vis > vis_prev, f"phase {ph}: visible area must grow"
+        vis_prev = vis
+    # Shadow side must be transparent: an early crescent covers well under
+    # the full disc's alpha area.
+    a1, _ = sprites.gen_moon(phase=1)
+    a_full, _ = sprites.gen_moon(phase=n - 1)
+    assert (a1 > 60).sum() < 0.6 * (a_full > 60).sum(), "shadow side not transparent"
+    # Full moon shows crater texture: luminance variance inside the lit disc.
+    _, lum_full = a_full, sprites.gen_moon(phase=n - 1)[1]
+    inside = a_full > 128
+    assert lum_full[inside].std() > 8, "craters missing"
 
 def test_drop_sprites():
     import sprites

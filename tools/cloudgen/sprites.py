@@ -109,9 +109,15 @@ def gen_rays(phase, size=480, n_rays=13):
 
 # --- moon -------------------------------------------------------------------
 
-def gen_moon(phase, size=120, n_craters=26):
+MOON_PHASE_COUNT = 32   # keep in sync with genpool.py and eva_weather_canvas.c's `ph` quantizer
+
+def gen_moon(phase, size=120, n_craters=26, phase_count=MOON_PHASE_COUNT):
     """Cratered moon with a phase terminator. phase 0 = thin crescent,
-    7 = full. Waning is handled at runtime by mirroring."""
+    phase_count-1 = full. The lit side is baked on the LEFT edge; the device
+    mirrors the sprite for WAXING phases (lit side right, northern
+    hemisphere) and draws it as stored for waning — see the moon blit in
+    main/eva_weather_canvas.c. Do not flip the terminator here without
+    also flipping that runtime mirror."""
     rng = np.random.default_rng(77)            # same craters every phase
     yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
     c = (size - 1) / 2.0
@@ -127,12 +133,28 @@ def gen_moon(phase, size=120, n_craters=26):
         # 0.28 = max crater darkness; the uniform(0.4, 1.0) factor varies it
         # per-crater so the surface doesn't look like uniform stamped dots.
         lum -= 0.28 * np.exp(-d2 / (cr * cr)) * rng.uniform(0.4, 1.0)
-    # Terminator: illuminated fraction grows with phase; the shadow edge is
-    # an ellipse sweeping across (simple but reads correctly at 120 px).
-    frac = (phase + 1) / 8.0                    # 0.125 .. 1.0
-    term = -1.0 + 2.0 * frac                    # -0.75 .. +1.0
-    lit = np.clip((term - dx) * 6.0 + 0.5, 0.0, 1.0) if frac < 1.0 else np.ones_like(dx)
-    lum = np.clip(lum * lit, 0.0, 1.0)
+    # Terminator: standard lunar-phase geometry. The terminator is the
+    # projection of a great circle on the sphere, seen edge-on — an ELLIPSE
+    # with semi-minor axis |k| = |cos(phase_angle)|, not a straight vertical
+    # chord. A straight chord was tried first (and briefly "area-corrected"
+    # with a circle-segment solve, 2026-07-18 first pass) but a straight
+    # line can never produce the classic thin-crescent silhouette: the
+    # correct crescent tip comes from two arcs (the disc edge + the
+    # terminator ellipse) meeting at the poles, not a disc-edge-plus-line.
+    # phase_angle: 0 = full, pi = new. illum = (1 - cos(phase_angle)) / 2.
+    frac = (phase + 1) / phase_count             # illum fraction, e.g. 1/32 .. 1.0
+    phase_angle = np.arccos(np.clip(2.0 * frac - 1.0, -1.0, 1.0))
+    k = np.cos(phase_angle)                     # -1 (new) .. 0 (quarter) .. 1 (full)
+    term_curve = k * np.sqrt(np.clip(1.0 - dy * dy, 0.0, 1.0))
+    edge_soft = 6.0                             # feather width, matches old sharpness
+    lit = np.clip((term_curve - dx) * edge_soft + 0.5, 0.0, 1.0) if frac < 1.0 else np.ones_like(dx)
+    # The unlit side must be TRANSPARENT, not black: gate the ALPHA plane
+    # (disc) with the terminator so the shadowed part lets the sky show
+    # through instead of stamping a dark circle. Luminance keeps full crater
+    # detail on the lit side. (2026-07-06 — was `lum *= lit`, a black disc by
+    # day; the runtime blends alpha=disc × colour=lum, so alpha must carry
+    # the phase.)
+    disc = np.clip(disc * lit, 0.0, 1.0)
     return _a8(disc), _a8(lum)
 
 # --- glass drops ------------------------------------------------------------

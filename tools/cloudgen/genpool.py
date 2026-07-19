@@ -12,6 +12,7 @@ import test_cloudgen
 
 NORMAL_VARIANTS = 4
 STORM_VARIANTS = 3
+MERGED_VARIANTS = 3
 W, H = 800, 768
 OUT = os.path.join(os.path.dirname(__file__), "out")
 PACK = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "clouds.bin")
@@ -35,13 +36,25 @@ CLOUD_POOL_STORM_LIT    = 3
 SOFT_BUDGET = int(10.5 * 1024 * 1024)
 PARTITION_BUDGET = 11 * 1024 * 1024 - 65536
 
+def portrait_pack(masks):
+    """Rotate light/shadow/core for portrait-native device draw."""
+    out = []
+    for m in masks:
+        out.append(cloudgen.to_portrait(m) if m is not None else None)
+    return tuple(out)
+
+def portrait_wh(masks):
+    """Return (w,h) header dims after to_portrait."""
+    m = next(m for m in masks if m is not None)
+    return int(m.shape[1]), int(m.shape[0])
+
 def write_pack(entries, pack_path):
     os.makedirs(os.path.dirname(pack_path), exist_ok=True)
     blobs = [open(path, "rb").read() for (_, _, _, _, path) in entries]
     toc_end = 6 + len(entries) * 12
     off = toc_end
     with open(pack_path, "wb") as f:
-        f.write(b"CLP2")
+        f.write(b"CLP3")
         f.write(struct.pack("<H", len(entries)))
         for (etype, layer, pool, variant, _path), blob in zip(entries, blobs):
             f.write(struct.pack("<BBBBII", layer, pool, variant, etype, off, len(blob)))
@@ -49,6 +62,26 @@ def write_pack(entries, pack_path):
         for blob in blobs:
             f.write(blob)
     return off
+
+import os as _os
+PORTRAIT = _os.environ.get("CLOUDGEN_PORTRAIT", "1") != "0"
+
+def pack_clm(path, masks, portrait=PORTRAIT):
+    if portrait:
+        masks = portrait_pack(masks)
+        pw, ph = portrait_wh(masks)
+    else:
+        pw, ph = W, H
+    return clm.write_clm(path, pw, ph, *masks)
+
+def validate_merged_storm_light(merged, light):
+    share = light.sum() / max((merged * 255.0).sum(), 1.0)
+    assert share >= 0.50, f"merged light share {share:.2f} < 0.50"
+    dense = merged > 0.5
+    if dense.any():
+        mean_dense = float(light[dense].mean())
+        assert mean_dense >= 100.0, \
+            f"merged dense-area light {mean_dense:.0f} < 100"
 
 def main():
     os.makedirs(OUT, exist_ok=True)
@@ -61,7 +94,7 @@ def main():
             D = cloudgen.gen_density(layer, seed=seed, w=W, h=H)
             masks = cloudgen.decompose(D, cloudgen.PROFILES[layer])
             path = os.path.join(OUT, f"cloud_L{layer}_v{v}.clm")
-            size = clm.write_clm(path, W, H, *masks)
+            size = pack_clm(path, masks)
             total += size
             entries.append((CLP_TYPE_CLOUD, layer, 0, v, path))
             print(f"{os.path.basename(path)}: {size/1024:.0f} KB")
@@ -72,15 +105,22 @@ def main():
             D = cloudgen.gen_density(layer, seed=seed, w=W, h=H, storm=True)
             masks = cloudgen.decompose(D, cloudgen.PROFILES_STORM[layer])
             path = os.path.join(OUT, f"cloud_L{layer}s_v{v}.clm")
-            size = clm.write_clm(path, W, H, *masks)
+            size = pack_clm(path, masks)
             total += size
             entries.append((CLP_TYPE_CLOUD, layer, 1, v, path))
             print(f"{os.path.basename(path)}: {size/1024:.0f} KB")
-    # merged (STORM_MERGED) + lit (STORM_LIT) storm pools NOT packed
-    # (2026-07-04): the on-device merged path never engaged and storm
-    # rendered as thin washed-out clouds; reverted to the plain per-layer
-    # STORM pool above. cloudgen.merge_strips/decompose_lit remain for
-    # possible future use but are unused here.
+    for v in range(MERGED_VARIANTS):
+        seed = 700 + v
+        D_mid = cloudgen.gen_density(1, seed=seed, w=W, h=H, storm=True)
+        D_low = cloudgen.gen_density(2, seed=seed, w=W, h=H, storm=True)
+        merged = cloudgen.merge_strips(D_mid, D_low)
+        light, _, _ = cloudgen.decompose(merged, cloudgen.PROFILES_STORM[2])
+        validate_merged_storm_light(merged, light)
+        path = os.path.join(OUT, f"cloud_merged_v{v}.clm")
+        size = pack_clm(path, (light, None, None))
+        total += size
+        entries.append((CLP_TYPE_CLOUD, 0, CLOUD_POOL_STORM_MERGED, v, path))
+        print(f"{os.path.basename(path)}: {size/1024:.0f} KB")
 
     print(f"CLOUDS: {total/1024/1024:.2f} MB")
     if total > SOFT_BUDGET:
@@ -102,21 +142,9 @@ def main():
         total_sprites += add_sprite(CLP_TYPE_BOLT, 0, v, (core, glow), f"bolt_v{v}.clm")
     for ph in range(4):
         total_sprites += add_sprite(CLP_TYPE_RAY, ph, 0, (spr.gen_rays(ph),), f"ray_p{ph}.clm")
-    for ph in range(8):
+    for ph in range(spr.MOON_PHASE_COUNT):
         a, lum = spr.gen_moon(ph)
         total_sprites += add_sprite(CLP_TYPE_MOON, ph, 0, (a, lum), f"moon_p{ph}.clm")
-    # Glass rain DROP + TRAIL sprites NOT packed (2026-07-04): the on-device
-    # per-drop sprite blit + full-screen wet-glass composite cost ~40 ms/frame
-    # and were removed from composite_glass_overlay(). The sprite lookup now
-    # simply misses; nothing draws them.
-
-    # Rain is NOT pre-baked as sprites (2026-07-04): 32 full-screen 800×480
-    # frames cost 11.7 MB resident PSRAM, which starved the cloud strip
-    # allocations (LOW-layer alloc failed → reboot loop). The device's
-    # primitive per-particle rain draw is cheap (~1-2 ms) and looks fine, so
-    # the RAIN sprite path is intentionally left unpopulated; the canvas
-    # falls through to the particle loop when the sprite lookup misses.
-    # (fog band likewise dropped — the CPU fog blobs stay.)
 
     pal = skygen.palette_dump()
     sky_entries = (

@@ -22,6 +22,10 @@
 #include "esp_timer.h"
 #include "driver/ppa.h"
 
+#ifdef EVA_PORTRAIT_NATIVE
+#include "eva_orient.h"
+#endif
+
 /* --- Fibonacci timing core ------------------------------------------------
  * Every cadence in Eva is expressed in Fibonacci numbers so animations share
  * the same golden rhythm and don't accidentally lock into beats. Keep this
@@ -54,6 +58,22 @@
 #define EVA_WEATHER_RENDER_H 480
 #define PPA_CACHE_ALIGN 128   /* ESP32-P4 L2 cache line; required for PPA DMA */
 #define EVA_FRAME_BYTES (EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t))
+
+#ifdef EVA_PORTRAIT_NATIVE
+#define EVA_FB_PIC_W EVA_PORT_W
+#define EVA_FB_PIC_H EVA_PORT_H
+static inline void eva_land_rect_to_port(int lx, int ly, int lw, int lh,
+                                         int *ox, int *oy, int *ow, int *oh)
+{
+    *ox = ly;
+    *oy = EVA_LAND_W - lx - lw;
+    *ow = lh;
+    *oh = lw;
+}
+#else
+#define EVA_FB_PIC_W EVA_WEATHER_RENDER_W
+#define EVA_FB_PIC_H EVA_WEATHER_RENDER_H
+#endif
 #define EVA_PHI 1.6180339f
 #define EVA_PHI2 (EVA_PHI * EVA_PHI)
 #define EVA_INV_PHI 0.61803399f
@@ -63,7 +83,11 @@
  * light/shadow/core masks, tinted and alpha-blended over the cached sky with
  * the P4 PPA blend engine. Variants crossfade and rebake over time so clouds
  * appear, dissolve, and reform instead of looping as one static strip. */
+#ifdef EVA_PORTRAIT_NATIVE
+#define CLOUD_STRIP_W 768
+#else
 #define CLOUD_STRIP_W 800
+#endif
 #define CLOUD_LAYER_HIGH 0
 #define CLOUD_LAYER_MID  1
 #define CLOUD_LAYER_LOW  2
@@ -236,6 +260,9 @@ LV_FONT_DECLARE(eva_font_uk_22);
 static lv_obj_t *s_canvas;
 static lv_timer_t *s_timer;
 static uint16_t *s_buf;
+
+static inline int eva_sbuf_idx(int xl, int yl);
+
 static uint16_t *s_bg_buf;
 /* Amortized background repaint: the sky is painted into s_bg_next in
  * ~64-row slices across frames (params snapshotted at slice 0 so the
@@ -264,12 +291,42 @@ static esp_lcd_panel_handle_t s_panel;
 static uint16_t *s_dpi_fb[2];
 static uint16_t *s_dpi_scan_fb;
 static uint16_t *s_dpi_back_fb;
+#ifdef EVA_PORTRAIT_NATIVE
+static void copy_landscape_rgb565_to_sbuf(const uint16_t *landscape_src)
+{
+    for (int y = 0; y < EVA_WEATHER_RENDER_H; ++y) {
+        for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
+            s_buf[eva_land_to_port_idx(x, y)] = landscape_src[y * EVA_WEATHER_RENDER_W + x];
+        }
+    }
+}
+
+static inline bool sbuf_is_portrait_fb(void)
+{
+    return s_buf == s_dpi_back_fb || s_buf == s_dpi_scan_fb;
+}
+#endif
+
+static inline int eva_sbuf_idx(int xl, int yl)
+{
+#ifdef EVA_PORTRAIT_NATIVE
+    if (sbuf_is_portrait_fb()) {
+        return eva_land_to_port_idx(xl, yl);
+    }
+#endif
+    return yl * EVA_WEATHER_RENDER_W + xl;
+}
+
 static SemaphoreHandle_t s_render_lock;
 static SemaphoreHandle_t s_ppa_done_sem;
 static SemaphoreHandle_t s_vsync_sem;
 static TaskHandle_t s_render_task;
 static TaskHandle_t s_bake_task;
 static bool s_cloud_assets_ok;   /* mmap'd CLP2 pack discovered at init */
+/* 3-plane volume rendering (shadow+core under the lit cap). On = the
+ * "beautiful" look; costs 3× PPA bands/layer. Toggle via CDC `cloudvolume`
+ * to A/B against light-only on hardware. */
+static volatile bool s_cloud_volume = false;
 static portMUX_TYPE s_frame_mux = portMUX_INITIALIZER_UNLOCKED;
 static ppa_client_handle_t s_ppa_srm;
 static ppa_client_handle_t s_ppa_blend;
@@ -416,6 +473,30 @@ static eva_sprite_t s_bolt_sprite;      /* active strike's sprite */
 static bool s_bolt_sprite_ok;
 static int s_bolt_x, s_bolt_y;          /* top-left blit anchor */
 static bool s_bolt_mirror;
+
+typedef struct {
+    uint8_t  channel_alpha;
+    uint8_t  flash_alpha;
+    uint8_t  sheet_only;
+    uint16_t flash_x;
+    uint16_t flash_y;
+    uint8_t  pt_count;
+    int16_t  x[LIGHTNING_PT_MAX];
+    int16_t  y[LIGHTNING_PT_MAX];
+    bool     has_branch;
+    int      branch_pts;
+    int16_t  bx[LIGHTNING_BRANCH_MAX];
+    int16_t  by[LIGHTNING_BRANCH_MAX];
+    bool     bolt_sprite_ok;
+    int      bolt_x;
+    int      bolt_y;
+    bool     bolt_mirror;
+} lightning_snap_t;
+
+static lightning_snap_t s_li_snap[2];
+static volatile uint8_t s_li_front;
+static portMUX_TYPE s_li_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static uint8_t s_bg_ttl;
 static float s_bg_dt;
 static bool s_visible;
@@ -677,7 +758,7 @@ static void blend_px(int x, int y, uint16_t color, uint8_t alpha)
     if ((unsigned)x >= EVA_WEATHER_RENDER_W || (unsigned)y >= EVA_WEATHER_RENDER_H) {
         return;
     }
-    uint16_t *p = &s_buf[y * EVA_WEATHER_RENDER_W + x];
+    uint16_t *p = &s_buf[eva_sbuf_idx(x, y)];
     if (alpha >= 240) {
         *p = color;
         return;
@@ -1216,12 +1297,10 @@ static void blit_text_mask_at(const scene_text_slot_t *slot, int dst_x, int dst_
             int srow = mrow - (int)slot->bbox_y0;     /* span-table row */
             if (srow < 0 || mrow >= (int)slot->bbox_y1) continue;
             const uint8_t *mask_row = &slot->a8[mrow * w];
-            uint16_t *dst_row = &s_buf[y * EVA_WEATHER_RENDER_W];
             for (uint32_t s = slot->row_start[srow];
                  s < slot->row_start[srow + 1]; ++s) {
                 int mx0 = slot->spans[s].x;
                 int mx1 = mx0 + slot->spans[s].len;
-                /* Clip the span to the caller's window [x0,x1) in dst space. */
                 int dx0 = mx0 + dst_x, dx1 = mx1 + dst_x;
                 if (dx0 < x0) dx0 = x0;
                 if (dx1 > x1) dx1 = x1;
@@ -1230,7 +1309,8 @@ static void blit_text_mask_at(const scene_text_slot_t *slot, int dst_x, int dst_
                     if (m == 0) continue;
                     uint8_t a = (uint8_t)(((uint16_t)m * (uint16_t)base_alpha) / 255U);
                     if (a == 0) continue;
-                    dst_row[x] = blend565(dst_row[x], color, a);
+                    int idx = eva_sbuf_idx(x, y);
+                    s_buf[idx] = blend565(s_buf[idx], color, a);
                 }
             }
         }
@@ -1239,14 +1319,14 @@ static void blit_text_mask_at(const scene_text_slot_t *slot, int dst_x, int dst_
     /* Fallback: original bbox scan. */
     for (int y = y0; y < y1; ++y) {
         const uint8_t *mask_row = &slot->a8[(y - dst_y) * w + (x0 - dst_x)];
-        uint16_t *dst_row = &s_buf[y * EVA_WEATHER_RENDER_W + x0];
         int run = x1 - x0;
         for (int i = 0; i < run; ++i) {
             uint8_t m = mask_row[i];
             if (m == 0) continue;
             uint8_t a = (uint8_t)(((uint16_t)m * (uint16_t)base_alpha) / 255U);
             if (a == 0) continue;
-            dst_row[i] = blend565(dst_row[i], color, a);
+            int idx = eva_sbuf_idx(x0 + i, y);
+            s_buf[idx] = blend565(s_buf[idx], color, a);
         }
     }
 }
@@ -2017,13 +2097,10 @@ static bool use_merged_storm_layers(void)
 
 static cloud_pool_t active_cloud_pool(int layer)
 {
-    /* merged/lit storm pools DISABLED 2026-07-04: on hardware the merged
-     * path never engaged (cloudinfo showed all layers "normal") and storm
-     * rendered as thin light clouds instead of a dense deck — an inverted/
-     * washed-out look. Reverted to the plain per-layer STORM pool, which
-     * rendered a correct dense storm ceiling. use_merged_storm_layers() /
-     * merged_storm_available() / CLOUD_POOL_STORM_MERGED|LIT are now dead. */
     if (layer == CLOUD_LAYER_HIGH) return CLOUD_POOL_NORMAL;
+    if (use_merged_storm_layers()) {
+        return CLOUD_POOL_STORM_MERGED;
+    }
     if ((s_kind == WEATHER_THUNDERSTORM || s_kind == WEATHER_HEAVY_RAIN) &&
         s_cloud_assets_ok &&
         eva_cloud_assets_count(layer, CLOUD_POOL_STORM) > 0) {
@@ -2217,11 +2294,11 @@ static void draw_rain_streak(int x0, int y0, int x1, int y1, uint16_t color, uin
     const int h = EVA_WEATHER_RENDER_H;
     for (;;) {
         if ((unsigned)x0 < (unsigned)w && (unsigned)y0 < (unsigned)h) {
-            uint16_t *p = &s_buf[y0 * w + x0];
+            int idx = eva_sbuf_idx(x0, y0);
             if (alpha >= 240) {
-                *p = color;
+                s_buf[idx] = color;
             } else {
-                *p = blend565(*p, color, alpha);
+                s_buf[idx] = blend565(s_buf[idx], color, alpha);
             }
         }
         if (x0 == x1 && y0 == y1) break;
@@ -2766,7 +2843,11 @@ static void draw_sun_or_moon(float t)
     sun_events(&sr, &ss);
     int m = minutes_now();
 
-    if (s_moon_pos.valid) {
+    /* Below the horizon (glide zone, elevation<=0): the moon has set/not yet
+     * risen — draw no disc. Without this, arc_progress_glide keeps the moon
+     * "valid" for ~10 min past moonset and its faint daytime disc showed as a
+     * ghost circle low in a corner (same bug fixed for the sun below). */
+    if (s_moon_pos.valid && s_moon_pos.elevation > 0.0f) {
         int moon_x = (int)(EVA_WEATHER_RENDER_W * s_moon_pos.x_n);
         int moon_y = (int)(EVA_WEATHER_RENDER_H * s_moon_pos.y_n);
         float n = eva_sky_nightness(m, sr, ss, civil_twilight_minutes());
@@ -2783,8 +2864,17 @@ static void draw_sun_or_moon(float t)
         uint8_t alpha_moon = (uint8_t)(a_f > 255.0f ? 255.0f : a_f);
         if (alpha_moon >= FIB_13) {
             eva_sprite_t moon;
-            int ph = ((int)s_moon_phase_pct * 8) / 101;
-            if (ph > 7) ph = 7;
+            /* 32 baked phases (was 8): each phase `ph` represents illum
+             * fraction (ph+1)/32, so its "center" is (ph+0.5)/32. Round to
+             * the NEAREST phase instead of flooring — flooring always picks
+             * the phase whose illum is >= pct, systematically overshooting
+             * (found 2026-07-18: pct=32 floored to phase 1/8, whose 37.5%
+             * illum read as visibly fuller than a real 32% crescent). With
+             * 32 phases the round-to-nearest error is at most ~1.6pp. */
+            float ph_f = ((float)s_moon_phase_pct / 100.0f) * (float)EVA_MOON_PHASE_COUNT - 0.5f;
+            int ph = (int)(ph_f + 0.5f);
+            if (ph < 0) ph = 0;
+            if (ph > EVA_MOON_PHASE_COUNT - 1) ph = EVA_MOON_PHASE_COUNT - 1;
             if (eva_cloud_assets_sprite(EVA_CLP_TYPE_MOON, ph, 0, &moon)) {
                 float night_k = n;
                 for (int y = 0; y < moon.h; ++y) {
@@ -2793,7 +2883,13 @@ static void draw_sun_or_moon(float t)
                     for (int x = 0; x < moon.w; ++x) {
                         int dx = moon_x - moon.w / 2 + x;
                         if ((unsigned)dx >= EVA_WEATHER_RENDER_W) continue;
-                        int sx = s_moon_waning ? (moon.w - 1 - x) : x;
+                        /* Sprite phases are baked lit-LEFT (see gen_moon in
+                         * tools/cloudgen/sprites.py). Northern-hemisphere
+                         * convention, same as the draw_moon_phase fallback:
+                         * waxing = lit side RIGHT, waning = lit LEFT. So
+                         * WAXING mirrors the sprite, waning draws as stored.
+                         * (Was inverted -> a young moon rendered as old.) */
+                        int sx = s_moon_waning ? x : (moon.w - 1 - x);
                         uint8_t a = moon.plane[0][y * moon.w + sx];
                         if (a < FIB_3) continue;
                         uint8_t l = moon.plane[1][y * moon.w + sx];
@@ -2803,8 +2899,8 @@ static void draw_sun_or_moon(float t)
                         uint16_t c = rgb565(lr, lg, lb);
                         uint8_t blend_a = (uint8_t)(((uint16_t)a * alpha_moon) / 255U);
                         if (blend_a) {
-                            s_buf[dy * EVA_WEATHER_RENDER_W + dx] =
-                                blend565(s_buf[dy * EVA_WEATHER_RENDER_W + dx], c, blend_a);
+                            int idx = eva_sbuf_idx(dx, dy);
+                            s_buf[idx] = blend565(s_buf[idx], c, blend_a);
                         }
                     }
                 }
@@ -2822,6 +2918,12 @@ static void draw_sun_or_moon(float t)
     if (!s_sun_pos.valid) return;
 
     float arc = s_sun_pos.elevation;
+    /* Below the horizon (glide zone, arc<=0): the sun has set — draw no disc.
+     * The position stays valid so the warm afterglow (warmth, arc>0 only) can
+     * still tint the sky during twilight, but the bright disc must not linger
+     * on-screen after sunset. Without this the horizon_boost'd disc showed a
+     * large low sun for ~10 min past the official sunset. */
+    if (arc <= 0.0f) return;
     float horizon_boost = (arc > 0.0f) ? (1.0f - arc) : 0.0f;
     s_sun_elevation = arc;
     int sun_x = (int)(EVA_WEATHER_RENDER_W * s_sun_pos.x_n);
@@ -2888,13 +2990,27 @@ static void draw_sun_fib_light(float t)
     if (is_night_kind(s_kind)) return;
     if (s_kind == WEATHER_THUNDERSTORM || s_kind == WEATHER_HEAVY_RAIN) return;
 
-    eva_sprite_t ray;
-    int phase = ((int)(t * 1.6f)) & 3;
-    if (eva_cloud_assets_sprite(EVA_CLP_TYPE_RAY, phase, 0, &ray)) {
-        int cx = s_sun_x - ray.w / 2;
-        int cy = s_sun_y - ray.h / 2;
-        blit_bolt_plane(ray.plane[0], ray.w, ray.h, cx, cy, false,
-                        s_ray_tint_565(), s_ray_alpha());
+    /* Smooth ray animation: instead of snapping between the 4 sprite phases
+     * (the old `(t*1.6)&3` jumped every ~0.6 s — visibly janky), crossfade
+     * between the current phase and the next. `pf` runs continuously; its
+     * integer part selects the phase, its fraction blends into the next one,
+     * so the fan breathes/rotates smoothly. The 4 phases are near-identical
+     * (2° rotation + slight gain), so the blend reads as gentle shimmer. */
+    float pf = t * 0.55f;                    /* slow, ~0.09 Hz per full cycle */
+    int phase = (int)pf & 3;
+    int next = (phase + 1) & 3;
+    float f = pf - floorf(pf);               /* 0..1 crossfade weight */
+    uint16_t tint = s_ray_tint_565();
+    uint8_t base_a = s_ray_alpha();
+    eva_sprite_t ray0, ray1;
+    if (eva_cloud_assets_sprite(EVA_CLP_TYPE_RAY, phase, 0, &ray0) &&
+        eva_cloud_assets_sprite(EVA_CLP_TYPE_RAY, next, 0, &ray1)) {
+        int cx = s_sun_x - ray0.w / 2;
+        int cy = s_sun_y - ray0.h / 2;
+        uint8_t a0 = (uint8_t)((float)base_a * (1.0f - f));
+        uint8_t a1 = (uint8_t)((float)base_a * f);
+        if (a0) blit_bolt_plane(ray0.plane[0], ray0.w, ray0.h, cx, cy, false, tint, a0);
+        if (a1) blit_bolt_plane(ray1.plane[0], ray1.w, ray1.h, cx, cy, false, tint, a1);
         return;
     }
 
@@ -3392,20 +3508,20 @@ static void blend_mask_cpu(const cloud_strip_t *strip,
         const uint8_t *src = &mask[y * CLOUD_STRIP_W + src_x];
         int dst_y = eff_y + y;
         if ((unsigned)dst_y >= EVA_WEATHER_RENDER_H) continue;
-        uint16_t *dst_row = &s_buf[dst_y * EVA_WEATHER_RENDER_W + dst_x];
         const uint16_t *sky_row = (bg_from_sky && s_bg_buf)
             ? &s_bg_buf[dst_y * EVA_WEATHER_RENDER_W + dst_x] : NULL;
         for (int x = 0; x < width; ++x) {
             uint8_t a = (uint8_t)(((uint16_t)src[x] * alpha_scale) / 255);
             if (a) {
-                uint16_t base = sky_row ? sky_row[x] : dst_row[x];
+                int idx = eva_sbuf_idx(dst_x + x, dst_y);
+                uint16_t base = sky_row ? sky_row[x] : s_buf[idx];
                 if (a >= 240) {
-                    dst_row[x] = tint;
+                    s_buf[idx] = tint;
                 } else {
-                    dst_row[x] = blend565(base, tint, a);
+                    s_buf[idx] = blend565(base, tint, a);
                 }
             } else if (sky_row) {
-                dst_row[x] = sky_row[x];
+                s_buf[eva_sbuf_idx(dst_x + x, dst_y)] = sky_row[x];
             }
         }
     }
@@ -3441,6 +3557,52 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
     if (strip_h <= 0) return ESP_OK;   /* fully off-screen: skip silently */
 
     const bool use_sky_bg = bg_from_sky && s_bg_buf;
+#ifdef EVA_PORTRAIT_NATIVE
+    if (use_sky_bg) {
+        return ESP_FAIL;   /* landscape sky cache → CPU path with idx transform */
+    }
+    int bg_ox, bg_oy, bg_bw, bg_bh;
+    int fg_ox, fg_oy, fg_bw, fg_bh;
+    eva_land_rect_to_port(dst_x, strip_top, width, strip_h,
+                          &bg_ox, &bg_oy, &bg_bw, &bg_bh);
+    eva_land_rect_to_port(src_x, mask_row_off, width, strip_h,
+                          &fg_ox, &fg_oy, &fg_bw, &fg_bh);
+    ppa_blend_oper_config_t cfg = {
+        .in_bg = {
+            .buffer = (void *)s_buf,
+            .pic_w = EVA_FB_PIC_W,
+            .pic_h = EVA_FB_PIC_H,
+            .block_w = (uint32_t)bg_bw,
+            .block_h = (uint32_t)bg_bh,
+            .block_offset_x = (uint32_t)bg_ox,
+            .block_offset_y = (uint32_t)bg_oy,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .in_fg = {
+            .buffer = (void *)mask,
+            .pic_w = CLOUD_STRIP_W,
+            .pic_h = (uint32_t)strip->strip_h,
+            .block_w = (uint32_t)fg_bw,
+            .block_h = (uint32_t)fg_bh,
+            .block_offset_x = (uint32_t)fg_ox,
+            .block_offset_y = (uint32_t)fg_oy,
+            .blend_cm = PPA_BLEND_COLOR_MODE_A8,
+        },
+        .out = {
+            .buffer = s_buf,
+            .buffer_size = EVA_FB_PIC_W * EVA_FB_PIC_H * sizeof(uint16_t),
+            .pic_w = EVA_FB_PIC_W,
+            .pic_h = EVA_FB_PIC_H,
+            .block_offset_x = (uint32_t)bg_ox,
+            .block_offset_y = (uint32_t)bg_oy,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .fg_alpha_update_mode = PPA_ALPHA_SCALE,
+        .fg_alpha_scale_ratio = (float)alpha_scale / 256.0f,
+        .fg_fix_rgb_val = { .b = tb, .g = tg, .r = tr },
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+#else
     ppa_blend_oper_config_t cfg = {
         .in_bg = {
             .buffer = use_sky_bg ? (void *)s_bg_buf : (void *)s_buf,
@@ -3476,6 +3638,7 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
         .fg_fix_rgb_val = { .b = tb, .g = tg, .r = tr },
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
+#endif
     esp_err_t err = ppa_do_blend(s_ppa_blend, &cfg);
     if (err == ESP_OK && bg_from_sky && s_blend_from_sky) {
         s_blend_from_sky = false;
@@ -3547,27 +3710,63 @@ static void blend_layer_variant(cloud_strip_t *strip,
     }
     uint8_t light_alpha = alpha_scale;
 
-    /* Light-only rendering: shadow and core skipped for performance.
-     *
-     * Trade-off: clouds lose under-shadow and dense-centre passes. On
-     * clear / partly-cloudy days this is close to what real cumulus
-     * humilis looks like (lit, fluffy, very faint underside). On
-     * overcast/storm scenes clouds will read flatter than before — the
-     * darker base is gone — but the device cannot sustain 3-pass blends
-     * within frame budget.
-     *
-     * If shadow needs to come back later, the gate should be
-     * `s_cloud_cover_pct > 70 && tick_hz > target_hz` (only spend on
-     * overcast when we have spare headroom). */
-    (void)shadow_alpha;
-    (void)core_alpha;
+    /* 3-plane volume rendering (restored 2026-07-03): shadow (belly) →
+     * core (dense centre) → light (sun-lit top), so the darker planes lie
+     * UNDER the lit cap and clouds read as volumes, not flat white tufts.
+     * Gated by s_cloud_volume so it can be A/B'd against light-only on the
+     * device — 3× the PPA bands per layer, measured on hardware. */
+    esp_err_t err = ESP_OK;
 
+    /* --- shadow + core, only when volume rendering is on --------------- */
+    if (s_cloud_volume) {
+        if (shadow_alpha) {
+            err = blend_mask_ppa_one_band(strip, v->a8_shadow,
+                                           strip->tint_shadow_r,
+                                           strip->tint_shadow_g,
+                                           strip->tint_shadow_b,
+                                           shadow_alpha,
+                                           eff_y, src_row0, src_row1,
+                                           scroll, 0, first_w,
+                                           s_blend_from_sky);
+            if (err == ESP_OK && second_w > 0) {
+                err = blend_mask_ppa_one_band(strip, v->a8_shadow,
+                                               strip->tint_shadow_r,
+                                               strip->tint_shadow_g,
+                                               strip->tint_shadow_b,
+                                               shadow_alpha,
+                                               eff_y, src_row0, src_row1,
+                                               0, first_w, second_w, sky_wrap);
+            }
+        }
+        if (err == ESP_OK && core_alpha) {
+            err = blend_mask_ppa_one_band(strip, v->a8_core,
+                                           strip->tint_core_r,
+                                           strip->tint_core_g,
+                                           strip->tint_core_b,
+                                           core_alpha,
+                                           eff_y, src_row0, src_row1,
+                                           scroll, 0, first_w, false);
+            if (err == ESP_OK && second_w > 0) {
+                err = blend_mask_ppa_one_band(strip, v->a8_core,
+                                               strip->tint_core_r,
+                                               strip->tint_core_g,
+                                               strip->tint_core_b,
+                                               core_alpha,
+                                               eff_y, src_row0, src_row1,
+                                               0, first_w, second_w, false);
+            }
+        }
+    } else {
+        (void)shadow_alpha;
+        (void)core_alpha;
+    }
+
+    /* --- light cap (always drawn, painted last so it sits on top) ------ */
     /* Cloud blend via PPA (hardware A8-over-RGB565). CPU blend was tried but
      * a full-width light mask is ~60 ms on the CPU — far worse than PPA even
      * with some engine contention against the SRM rotation. Falls back to CPU
      * only if the PPA call errors out. */
-    esp_err_t err = ESP_OK;
-    if (light_alpha) {
+    if (err == ESP_OK && light_alpha) {
         err = blend_mask_ppa_one_band(strip, v->a8_light,
                                        strip->tint_light_r,
                                        strip->tint_light_g,
@@ -3575,7 +3774,7 @@ static void blend_layer_variant(cloud_strip_t *strip,
                                        light_alpha,
                                        eff_y, src_row0, src_row1,
                                        scroll, 0, first_w,
-                                       s_blend_from_sky);
+                                       s_cloud_volume ? false : s_blend_from_sky);
         if (err == ESP_OK && second_w > 0) {
             /* Wrap band sits right of the seam; s_buf there still holds last
              * frame's rain/text unless we read the cached sky as bg. */
@@ -3586,7 +3785,7 @@ static void blend_layer_variant(cloud_strip_t *strip,
                                            light_alpha,
                                            eff_y, src_row0, src_row1,
                                            0, first_w, second_w,
-                                           sky_wrap);
+                                           s_cloud_volume ? false : sky_wrap);
         }
     }
     if (err == ESP_OK) return;
@@ -4298,9 +4497,9 @@ static void composite_lightning_flash(uint8_t alpha)
         for (int y = 0; y < y1; y += 2) {
             uint8_t row_a = (uint8_t)((sky_a * (y1 - y)) / (y1 + 1));
             if (row_a < FIB_2) continue;
-            uint16_t *row = &s_buf[y * EVA_WEATHER_RENDER_W];
             for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 2) {
-                row[x] = blend565(row[x], warm, row_a);
+                int idx = eva_sbuf_idx(x, y);
+                s_buf[idx] = blend565(s_buf[idx], warm, row_a);
             }
         }
     }
@@ -4385,6 +4584,43 @@ static void update_lightning(float dt, float t)
     }
 }
 
+static void lightning_publish_snapshot(void)
+{
+    uint8_t back = (uint8_t)(s_li_front ^ 1u);
+    lightning_snap_t *snap = &s_li_snap[back];
+    snap->channel_alpha = clamp_u8((int)s_lightning_channel_alpha);
+    snap->flash_alpha = clamp_u8((int)s_lightning_flash_alpha);
+    snap->sheet_only = (uint8_t)s_lightning_sheet_only;
+    snap->flash_x = (uint16_t)s_lightning_flash_x;
+    snap->flash_y = (uint16_t)s_lightning_flash_y;
+    snap->pt_count = (uint8_t)s_lightning_pt_count;
+    memcpy(snap->x, s_lightning_x, sizeof snap->x);
+    memcpy(snap->y, s_lightning_y, sizeof snap->y);
+    snap->has_branch = s_lightning_has_branch;
+    snap->branch_pts = s_lightning_branch_pts;
+    memcpy(snap->bx, s_lightning_bx, sizeof snap->bx);
+    memcpy(snap->by, s_lightning_by, sizeof snap->by);
+    snap->bolt_sprite_ok = s_bolt_sprite_ok;
+    snap->bolt_x = s_bolt_x;
+    snap->bolt_y = s_bolt_y;
+    snap->bolt_mirror = s_bolt_mirror;
+    portENTER_CRITICAL(&s_li_mux);
+    s_li_front = back;
+    portEXIT_CRITICAL(&s_li_mux);
+}
+
+static void lightning_task(void *arg)
+{
+    (void)arg;
+    const TickType_t period = pdMS_TO_TICKS(8);
+    for (;;) {
+        float t = (float)esp_timer_get_time() * 1e-6f;
+        update_lightning(1.0f / 120.0f, t);
+        lightning_publish_snapshot();
+        vTaskDelay(period);
+    }
+}
+
 /* Additive-ish A8 sprite blit: dst brightened toward tint by plane alpha × scale. */
 static void blit_bolt_plane(const uint8_t *plane, int w, int h,
                             int x0, int y0, bool mirror,
@@ -4395,44 +4631,56 @@ static void blit_bolt_plane(const uint8_t *plane, int w, int h,
         int dy = y0 + y;
         if ((unsigned)dy >= EVA_WEATHER_RENDER_H) continue;
         const uint8_t *src = &plane[y * w];
-        uint16_t *dst = &s_buf[dy * EVA_WEATHER_RENDER_W];
         for (int x = 0; x < w; ++x) {
             uint8_t m = src[mirror ? (w - 1 - x) : x];
-            if (m < FIB_2) continue;   /* skip effectively-transparent texels */
+            if (m < FIB_2) continue;
             int dx = x0 + x;
             if ((unsigned)dx >= EVA_WEATHER_RENDER_W) continue;
             uint8_t a = (uint8_t)(((uint16_t)m * scale) / 255U);
-            if (a) dst[dx] = blend565(dst[dx], tint, a);
+            if (a) {
+                int idx = eva_sbuf_idx(dx, dy);
+                s_buf[idx] = blend565(s_buf[idx], tint, a);
+            }
         }
     }
 }
 
 static void composite_lightning_on_render(void)
 {
-    uint8_t flash_a = clamp_u8((int)s_lightning_flash_alpha);
-    uint8_t bolt_a = clamp_u8((int)s_lightning_channel_alpha);
+    lightning_snap_t snap;
+    portENTER_CRITICAL(&s_li_mux);
+    snap = s_li_snap[s_li_front];
+    portEXIT_CRITICAL(&s_li_mux);
+
+    uint8_t flash_a = snap.flash_alpha;
+    uint8_t bolt_a = snap.channel_alpha;
     if (flash_a < FIB_2 && bolt_a < FIB_2) return;
 
     if (flash_a >= FIB_2 && !s_storm_lit_active) {
+        int save_x = s_lightning_flash_x;
+        int save_y = s_lightning_flash_y;
+        s_lightning_flash_x = (int16_t)snap.flash_x;
+        s_lightning_flash_y = (int16_t)snap.flash_y;
         composite_lightning_flash(flash_a);
+        s_lightning_flash_x = save_x;
+        s_lightning_flash_y = save_y;
     }
 
-    if (s_lightning_sheet_only || bolt_a < FIB_2) return;
+    if (snap.sheet_only || bolt_a < FIB_2) return;
 
     uint16_t core = rgb565(248, 252, 255);
     uint16_t glow = rgb565(188, 210, 255);
-    if (s_bolt_sprite_ok) {
+    if (snap.bolt_sprite_ok) {
         blit_bolt_plane(s_bolt_sprite.plane[1], s_bolt_sprite.w, s_bolt_sprite.h,
-                        s_bolt_x, s_bolt_y, s_bolt_mirror,
+                        snap.bolt_x, snap.bolt_y, snap.bolt_mirror,
                         glow, (uint8_t)((bolt_a * BOLT_GLOW_SCALE_NUM) / BOLT_GLOW_SCALE_DEN));
         blit_bolt_plane(s_bolt_sprite.plane[0], s_bolt_sprite.w, s_bolt_sprite.h,
-                        s_bolt_x, s_bolt_y, s_bolt_mirror,
+                        snap.bolt_x, snap.bolt_y, snap.bolt_mirror,
                         core, bolt_a);
     } else {
-        draw_lightning_path(s_lightning_x, s_lightning_y, s_lightning_pt_count,
-                            core, glow, bolt_a);
-        if (s_lightning_has_branch) {
-            draw_lightning_path(s_lightning_bx, s_lightning_by, s_lightning_branch_pts,
+        draw_lightning_path(snap.x, snap.y, snap.pt_count, core, glow, bolt_a);
+        if (snap.has_branch) {
+            draw_lightning_path(snap.bx, snap.by, snap.branch_pts,
                                 core, glow, clamp_u8((bolt_a * FIB_89) / 255));
         }
     }
@@ -4509,12 +4757,14 @@ static void composite_wet_glass_band(void)
     const uint16_t tint = rgb565(196, 206, 220);
     for (int y = s_wet_y0; y <= s_wet_y1; ++y) {
         const uint8_t *src = &s_wet_glass[y * EVA_WEATHER_RENDER_W];
-        uint16_t *dst = &s_buf[y * EVA_WEATHER_RENDER_W];
         for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
             uint8_t wv = src[x];
             if (wv < FIB_2) continue;
             uint8_t a = (uint8_t)(wv >> 1);
-            if (a) dst[x] = blend565(dst[x], tint, a);
+            if (a) {
+                int idx = eva_sbuf_idx(x, y);
+                s_buf[idx] = blend565(s_buf[idx], tint, a);
+            }
         }
     }
 }
@@ -4871,8 +5121,12 @@ static esp_err_t ppa_copy_rgb565(uint16_t *dst, const uint16_t *src)
     if (!dst || !src) {
         return ESP_ERR_INVALID_ARG;
     }
-    /* CPU memcpy — shares s_ppa_srm with non-blocking panel rotation; a second
-     * PPA SRM client here overflowed max_pending_trans_num=1 on boot. */
+#ifdef EVA_PORTRAIT_NATIVE
+    if (dst == s_dpi_back_fb || dst == s_dpi_scan_fb) {
+        copy_landscape_rgb565_to_sbuf(src);
+        return ESP_OK;
+    }
+#endif
     memcpy(dst, src, EVA_FRAME_BYTES);
     return ESP_OK;
 }
@@ -5072,18 +5326,7 @@ static void render_weather(float dt)
     int64_t tb3 = esp_timer_get_time();
     s_prof_particles_us += (tb3 - tb_overlay0);
 
-    /* Lightning STATE updates here (strike scheduling must tick every
-     * frame), but the visual composite happens AFTER the cloud blend — a
-     * bolt reads below the cloud base and the flash must illuminate the
-     * cloud deck itself. With the composite under the clouds, a 100 %-cover
-     * storm painted over every strike (bug found 2026-07-02). */
-    update_lightning(dt, t);
-    /* Lit storm pool disabled with the merged-pool revert (2026-07-04) —
-     * keep the flag false so the flash composites over the plain storm deck
-     * as it did before merged pools existed. */
     s_storm_lit_active = false;
-    int64_t tb4 = esp_timer_get_time();
-    s_prof_lightning_us += (tb4 - tb3);
 
     int64_t tb_text0 = esp_timer_get_time();
     if (!s_scene_text_done_this_frame) {
@@ -5198,7 +5441,11 @@ static void native_render_task(void *arg)
     int64_t tick_min = 1000000, tick_max = 0;   /* DIAG: frame interval jitter */
 
     while (true) {
+#ifdef EVA_PORTRAIT_NATIVE
+        if (!s_visible || !s_panel || !s_dpi_back_fb) {
+#else
         if (!s_visible || !s_render_buf || !s_panel || !s_dpi_back_fb) {
+#endif
             s_last_us = esp_timer_get_time();
             vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
             continue;
@@ -5215,13 +5462,18 @@ static void native_render_task(void *arg)
         if (s_render_lock) {
             xSemaphoreTake(s_render_lock, portMAX_DELAY);
         }
+#ifdef EVA_PORTRAIT_NATIVE
+        s_buf = s_dpi_back_fb;
+#else
         s_buf = s_render_buf;
+#endif
         render_weather(dt);
         if (s_render_lock) {
             xSemaphoreGive(s_render_lock);
         }
         int64_t t_render = esp_timer_get_time();
 
+#ifndef EVA_PORTRAIT_NATIVE
         esp_err_t err = rotate_render_to_dpi_fb(s_dpi_back_fb);
         if (err == ESP_OK) {
             if (xSemaphoreTake(s_ppa_done_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -5234,6 +5486,9 @@ static void native_render_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
             continue;
         }
+#else
+        esp_err_t err = ESP_OK;
+#endif
         int64_t t_rotate = esp_timer_get_time();
 
         err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, 480, 800, s_dpi_back_fb);
@@ -5609,8 +5864,17 @@ void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel)
         ESP_LOGE(TAG, "native render task create failed");
         abort();
     }
+    if (xTaskCreatePinnedToCore(lightning_task, "eva_lightning", 4096,
+                                NULL, 4, NULL, 0) != pdTRUE) {
+        ESP_LOGW(TAG, "lightning task create failed");
+    }
+#ifdef EVA_PORTRAIT_NATIVE
+    ESP_LOGI(TAG, "native render path ready: portrait %ux%u direct to DPI fb (no PPA rotate)",
+             (unsigned)EVA_FB_PIC_W, (unsigned)EVA_FB_PIC_H);
+#else
     ESP_LOGI(TAG, "native render path ready: %ux%u landscape -> PPA rotate -> 480x800 DPI fb",
              (unsigned)EVA_WEATHER_RENDER_W, (unsigned)EVA_WEATHER_RENDER_H);
+#endif
 }
 
 /* Default cloud coverage and fog for each weather kind. Used by
@@ -5848,6 +6112,12 @@ const uint16_t *eva_weather_canvas_display_buf(void)
 void eva_weather_canvas_trigger_lightning(void)
 {
     s_lightning_force = true;
+}
+
+bool eva_weather_canvas_toggle_volume(void)
+{
+    s_cloud_volume = !s_cloud_volume;
+    return s_cloud_volume;
 }
 
 bool eva_weather_canvas_copy_display(uint16_t *dst, size_t dst_bytes)
