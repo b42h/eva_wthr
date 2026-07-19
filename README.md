@@ -8,13 +8,13 @@ over hosted Wi-Fi.
 
 ## Current look
 
-| Clear day | Partly cloudy |
+| Moving clouds | Rain + lightning |
 |---|---|
-| ![Clear day](docs/images/01-clear-day.jpg) | ![Partly cloudy](docs/images/02-partly-cloudy.jpg) |
+| ![Clouds moving](docs/images/05-clouds-moving.gif) | ![Thunderstorm rain and lightning](docs/images/06-thunderstorm-rain.gif) |
 
-| Overcast | Thunderstorm |
+| Moon at night | Sunrise |
 |---|---|
-| ![Overcast](docs/images/03-cloudy.jpg) | ![Thunderstorm](docs/images/04-thunderstorm.jpg) |
+| ![Moon at night](docs/images/07-moon-at-night.gif) | ![Sunrise](docs/images/08-sunrise.gif) |
 
 ## Features
 
