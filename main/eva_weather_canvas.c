@@ -1,6 +1,7 @@
 #include "eva_weather_canvas.h"
 #include "eva_cloud_assets.h"
 #include "eva_clp_toc.h"
+#include "eva_wx_transition.h"
 #include "eva_dither.h"
 #include "eva_sky_palette.h"
 #include "eva_text_spans.h"
@@ -350,6 +351,12 @@ static inline bool scene_text_can_cache(weather_kind_t kind)
 }
 
 static float s_density_scale = 1.0f;
+/* Smooth weather transition state. Set by eva_weather_canvas_set_weather(),
+ * ticked by wx_transition_tick() in render_weather(). See
+ * docs/superpowers/specs/2026-07-19-smooth-weather-transitions-design.md */
+static eva_wx_transition_t s_wx_trans;
+static float s_wx_trans_duration_s = EVA_WX_TRANSITION_DEFAULT_S;
+static float s_wx_last_bake_p = -1.0f;   /* eased progress at last sky rebake */
 static precip_type_t s_precip_type = PRECIP_NONE;
 static particle_t s_particles[PARTICLE_MAX];
 static cloud_strip_t s_strip[CLOUD_LAYER_COUNT] = {
@@ -1633,6 +1640,24 @@ static sky_t sky_for_kind(weather_kind_t kind)
     return sky_from_eva(eva_sky_for_kind(kind, &ctx));
 }
 
+/* Sky to paint this rebake: during a transition, blend the from-kind and
+ * to-kind palettes by the eased progress; otherwise just the current kind.
+ * Both sky_for_kind() calls fold in the current daypart/nightness, so
+ * day/night stays correct throughout. Two rgb lerps, cold path (per rebake).*/
+static sky_t wx_current_sky(void)
+{
+    if (!s_wx_trans.active) {
+        return sky_for_kind(s_kind);
+    }
+    float p = eva_wx_ease(s_wx_trans.progress);
+    sky_t a = sky_for_kind((weather_kind_t)s_wx_trans.from_kind);
+    sky_t b = sky_for_kind((weather_kind_t)s_wx_trans.to_kind);
+    sky_t out = b;                 /* carry b.name */
+    out.top    = lerp_rgb(a.top,    b.top,    p);
+    out.bottom = lerp_rgb(a.bottom, b.bottom, p);
+    return out;
+}
+
 /* Visual daypart from wall clock + sun events. Shared by clock scale, sky
  * warmth, and text cache invalidation — independent of forced day/night kinds
  * used only for luminary placement in weatherdebug. */
@@ -2446,6 +2471,11 @@ static void target_for_kind(weather_kind_t kind)
         s_target = phi_count(17.0f, EVA_PHI); s_max_target = phi_count(17.0f, EVA_PHI2); break;
     default:
         s_target = 0; s_max_target = 80; break;
+    }
+    if (s_wx_trans.active) {
+        bool same_precip = (s_wx_trans.from_precip == s_wx_trans.to_precip);
+        float ramp = eva_wx_precip_ramp(s_wx_trans.progress, same_precip);
+        s_target = (uint16_t)((float)s_target * ramp + 0.5f);
     }
 }
 
@@ -5212,8 +5242,59 @@ void eva_weather_canvas_cloud_info(char *buf, size_t buf_len)
     }
 }
 
+/* Drive the live render fields from the active transition. Called once per
+ * frame at the very top of render_weather(). Returns true if the transition
+ * finalized on this call (so render_weather can run the deferred kind reset).*/
+static bool wx_transition_tick(float dt)
+{
+    if (!s_wx_trans.active) return false;
+
+    float p = eva_wx_ease(s_wx_trans.progress);
+
+    s_cloud_cover_pct = eva_wx_lerp_u8(s_wx_trans.start_cover,
+                                       s_wx_trans.target_cover, p);
+    for (int i = 0; i < 3; ++i) {
+        s_cloud_pct[i] = eva_wx_lerp_u8(s_wx_trans.start_cloud_pct[i],
+                                        s_wx_trans.target_cloud_pct[i], p);
+    }
+    s_fog_pct = eva_wx_lerp_u8(s_wx_trans.start_fog, s_wx_trans.target_fog, p);
+    s_density_scale = eva_wx_lerp_f(s_wx_trans.start_density,
+                                    s_wx_trans.target_density, p);
+
+    /* Re-derive the active 3D cloud count from the interpolated cover, exactly
+     * as eva_weather_canvas_set_weather does. */
+    int desired_active = (int)(((long)s_cloud_cover_pct * CLOUD_3D_MAX + 50) / 100);
+    if (desired_active < 4) desired_active = 4;
+    if (desired_active > CLOUD_3D_MAX) desired_active = CLOUD_3D_MAX;
+    s_clouds3d_active = (uint8_t)desired_active;
+
+    /* Precip identity flips at the midpoint; s_kind flips with it so the sky
+     * blend (Task 4) and particle reset (below) use the right target. */
+    int precip_now = eva_wx_precip_at(&s_wx_trans, s_wx_trans.progress);
+    s_precip_type = (precip_type_t)precip_now;
+    s_kind = (s_wx_trans.progress < 0.5f)
+             ? (weather_kind_t)s_wx_trans.from_kind
+             : (weather_kind_t)s_wx_trans.to_kind;
+
+    /* Recompute particle target each frame so the precip ramp animates
+     * (target_for_kind is otherwise only called on kind reset). */
+    target_for_kind(s_kind);
+
+    bool finished = eva_wx_advance(&s_wx_trans, dt);
+    if (finished) {
+        s_kind = (weather_kind_t)s_wx_trans.to_kind;
+        s_precip_type = (precip_type_t)s_wx_trans.to_precip;
+        target_for_kind(s_kind);   /* full intensity, ramp inactive */
+    }
+    return finished;
+}
+
 static void render_weather(float dt)
 {
+    /* Advance any active smooth transition first — it may flip s_kind at the
+     * midpoint, which the reset block below then reacts to (once). */
+    wx_transition_tick(dt);
+
     if (s_kind != s_prev_kind) {
         reset_particles_for_kind();
         reset_glass_overlay_for_kind();
@@ -5240,7 +5321,7 @@ static void render_weather(float dt)
     if (!s_bg_buf || (!s_bg_next && s_bg_ttl == 0)) {
         /* Fallback path (bg buffers unavailable): synchronous full paint
          * into the frame, exactly the old behaviour. */
-        sky_t sky = sky_for_kind(s_kind);
+        sky_t sky = wx_current_sky();
         s_sky_bottom = sky.bottom;   /* cache for sky-tinted rain streaks */
         int m = minutes_now();
         compute_luminary_positions(m);
@@ -5256,10 +5337,20 @@ static void render_weather(float dt)
         sky_refreshed = true;
     } else {
         if (s_bg_ttl > 0) s_bg_ttl--;
+        /* During a transition, advance the rebake whenever eased progress has
+         * moved ~0.09 since the last sky bake — ~11 rebakes across the whole
+         * transition, so the gradient visibly eases without per-frame cost. */
+        if (s_wx_trans.active) {
+            float pe = eva_wx_ease(s_wx_trans.progress);
+            if (pe - s_wx_last_bake_p >= 0.09f) {
+                s_bg_ttl = 0;
+            }
+        }
         if (s_bg_ttl == 0 && s_bg_paint_row < 0) {
             /* Snapshot everything the repaint needs so the buffer stays
              * consistent while slices land across several frames. */
-            s_bg_snap_sky = sky_for_kind(s_kind);
+            s_wx_last_bake_p = eva_wx_ease(s_wx_trans.progress);
+            s_bg_snap_sky = wx_current_sky();
             s_sky_bottom = s_bg_snap_sky.bottom;
             compute_luminary_positions(minutes_now());
             s_bg_snap_sun_x = s_sun_pos.x_n;
@@ -5944,6 +6035,15 @@ void eva_weather_canvas_set_kind(weather_kind_t kind)
 void eva_weather_canvas_set_weather(const weather_state_t *st)
 {
     if (!st) return;
+    /* Snapshot current LIVE render values before we overwrite them — these
+     * become the transition's start point (or, if a transition is already
+     * running, they already hold the interpolated mid-values, so restarting
+     * from them is seamless). */
+    uint8_t wx_prev_cover        = s_cloud_cover_pct;
+    uint8_t wx_prev_cloud_pct[3] = { s_cloud_pct[0], s_cloud_pct[1], s_cloud_pct[2] };
+    uint8_t wx_prev_fog          = s_fog_pct;
+    float   wx_prev_density      = s_density_scale;
+    precip_type_t wx_prev_precip = s_precip_type;
     weather_kind_t kind = st->kind;
     if (kind <= WEATHER_UNKNOWN || kind >= WEATHER_KIND_COUNT) {
         kind = WEATHER_CLOUDY;
@@ -6028,23 +6128,82 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
         s_wind_kph_eff = new_kph;
     }
 
-    bool kind_changed = (s_kind != kind);
-    s_kind = kind;
-    s_density_scale = density;
+    /* --- Smooth transition decision ------------------------------------
+     * At this point s_cloud_cover_pct, s_cloud_pct[], s_fog_pct, etc. have
+     * ALREADY been overwritten above with the new target values, and the
+     * live-vs-target lerp below re-derives the visible values each frame.
+     * We captured the OLD live values into locals before the overwrite (see
+     * the snapshot added just below the s_* assignments). */
+    bool significant = eva_wx_change_is_significant(
+        (int)s_kind, wx_prev_cover, (int)wx_prev_precip,
+        (int)kind, s_cloud_cover_pct, (int)st->precip_type);
 
-    if (kind_changed) {
-        s_prev_kind = WEATHER_UNKNOWN;
-        s_scene_slot.valid = false;
-        s_clouds3d_inited = false;
-        s_frames = 0;
-        s_accum_us = 0;
-        s_accum_tick_us = 0;
-        s_over_budget = 0;
-        s_under_budget = 0;
-        s_bg_ttl = 0;
-        s_bg_dt = 0.0f;
-        /* Note: s_clouds3d_active is already set above by cloud_cover_pct adaptation;
-         * don't reset it here to preserve the adapted count. */
+    bool first_state = (s_kind == WEATHER_UNKNOWN);
+
+    if (!significant || first_state) {
+        /* Instant apply (first state / NVS restore / temp-text-only change). */
+        s_wx_trans.active = false;
+        bool kind_changed = (s_kind != kind);
+        s_kind = kind;
+        s_density_scale = density;
+        if (kind_changed) {
+            s_prev_kind = WEATHER_UNKNOWN;
+            s_scene_slot.valid = false;
+            s_clouds3d_inited = false;
+            s_frames = 0;
+            s_accum_us = 0;
+            s_accum_tick_us = 0;
+            s_over_budget = 0;
+            s_under_budget = 0;
+            s_bg_ttl = 0;
+            s_bg_dt = 0.0f;
+        }
+        return;
+    }
+
+    /* Begin (or restart) a transition. start_* = the OLD live values we
+     * snapshotted; target_* = the new values already in s_*. If a transition
+     * was already running, start from the CURRENT interpolated values so we
+     * never snap. */
+    s_wx_trans.start_cover        = wx_prev_cover;
+    s_wx_trans.start_cloud_pct[0] = wx_prev_cloud_pct[0];
+    s_wx_trans.start_cloud_pct[1] = wx_prev_cloud_pct[1];
+    s_wx_trans.start_cloud_pct[2] = wx_prev_cloud_pct[2];
+    s_wx_trans.start_fog          = wx_prev_fog;
+    s_wx_trans.start_density      = wx_prev_density;
+
+    s_wx_trans.target_cover        = s_cloud_cover_pct;
+    s_wx_trans.target_cloud_pct[0] = s_cloud_pct[0];
+    s_wx_trans.target_cloud_pct[1] = s_cloud_pct[1];
+    s_wx_trans.target_cloud_pct[2] = s_cloud_pct[2];
+    s_wx_trans.target_fog          = s_fog_pct;
+    s_wx_trans.target_density      = density;
+
+    s_wx_trans.from_kind   = (int)s_kind;
+    s_wx_trans.to_kind     = (int)kind;
+    s_wx_trans.from_precip = (int)wx_prev_precip;
+    s_wx_trans.to_precip   = (int)st->precip_type;
+
+    s_wx_trans.duration_s = s_wx_trans_duration_s;
+    s_wx_trans.progress   = 0.0f;
+    s_wx_trans.active     = true;
+    s_wx_last_bake_p = -1.0f;   /* force a rebake on the first transitioning frame */
+
+    /* Keep the render on the OLD kind/precip until the tick finalizes or
+     * crosses the midpoint. Do NOT overwrite s_kind / s_precip_type here. */
+    s_cloud_cover_pct = wx_prev_cover;
+    s_cloud_pct[0] = wx_prev_cloud_pct[0];
+    s_cloud_pct[1] = wx_prev_cloud_pct[1];
+    s_cloud_pct[2] = wx_prev_cloud_pct[2];
+    s_fog_pct = wx_prev_fog;
+    s_density_scale = wx_prev_density;   /* start from old; tick will lerp */
+    s_kind = s_kind;                     /* explicit no-op: stays old kind */
+    s_precip_type = (precip_type_t)s_wx_trans.from_precip;
+    {
+        int desired = (int)(((long)s_cloud_cover_pct * CLOUD_3D_MAX + 50) / 100);
+        if (desired < 4) desired = 4;
+        if (desired > CLOUD_3D_MAX) desired = CLOUD_3D_MAX;
+        s_clouds3d_active = (uint8_t)desired;
     }
 }
 
@@ -6070,6 +6229,12 @@ void eva_weather_canvas_show(bool show)
 void eva_weather_canvas_set_time_offset(int hours)
 {
     s_time_offset_hours = hours;
+}
+
+void eva_weather_canvas_set_transition_ms(int ms)
+{
+    if (ms < 0) ms = 0;
+    s_wx_trans_duration_s = (float)ms / 1000.0f;
 }
 
 void eva_weather_canvas_set_clock_text(const char *text)

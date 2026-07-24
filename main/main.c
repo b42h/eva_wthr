@@ -1899,7 +1899,8 @@ static void cdc_handle_command(void *user, char *line)
             "  weatherpin on|off — freeze the scene against live fetch\r\n"
             "  screenshot\r\n"
             "  log\r\n"
-            "  log <none|error|warn|info|debug|verbose>\r\n");
+            "  log <none|error|warn|info|debug|verbose>\r\n"
+            "  transition <ms> — smooth-transition duration (0 = instant)\r\n");
         return;
     }
 
@@ -1977,6 +1978,27 @@ static void cdc_handle_command(void *user, char *line)
     if (strcmp(cmd, "lightning") == 0) {
         eva_weather_canvas_trigger_lightning();
         cdc_send("OK lightning strike queued (fires only in thunderstorm/hail)\r\n");
+        return;
+    }
+
+    if (strncmp(cmd, "transition", 10) == 0 &&
+        (cmd[10] == '\0' || isspace((unsigned char)cmd[10]))) {
+        if (cmd[10] == '\0') {
+            cdc_send("usage: transition <ms>  (0 = instant)\r\n");
+            return;
+        }
+        char *value = trim_in_place(cmd + 10);
+        int ms = atoi(value);
+        if (ms < 0) ms = 0;
+        eva_weather_canvas_set_transition_ms(ms);
+        cdc_sendf("OK transition duration %d ms\r\n", ms);
+        return;
+    }
+
+    if (strcmp(cmd, "cloudvolume") == 0) {
+        bool on = eva_weather_canvas_toggle_volume();
+        cdc_sendf("OK cloud volume %s (3-plane %s)\r\n",
+                  on ? "ON" : "OFF", on ? "shadow+core+light" : "light-only");
         return;
     }
 

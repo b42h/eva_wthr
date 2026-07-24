@@ -21,6 +21,9 @@ void eva_weather_canvas_set_kind(weather_kind_t kind);
 void eva_weather_canvas_set_weather(const weather_state_t *st);
 void eva_weather_canvas_show(bool show);
 void eva_weather_canvas_set_time_offset(int hours);
+/* Duration of smooth weather transitions, in milliseconds. 0 = instant
+ * (snap, for A/B comparison). Default is EVA_WX_TRANSITION_DEFAULT_S. */
+void eva_weather_canvas_set_transition_ms(int ms);
 void eva_weather_canvas_set_clock_text(const char *text);
 void eva_weather_canvas_set_date_text(const char *text);
 void eva_weather_canvas_set_temp_text(const char *text);
@@ -38,6 +41,10 @@ const uint16_t *eva_weather_canvas_display_buf(void);
  * Only fires while the active kind is THUNDERSTORM or HAIL — the lightning
  * state machine is gated to those kinds. */
 void eva_weather_canvas_trigger_lightning(void);
+
+/* Toggle 3-plane volume cloud rendering (shadow+core under the lit cap).
+ * Returns the new state. CDC `cloudvolume` test command. */
+bool eva_weather_canvas_toggle_volume(void);
 
 /* Copy a coherent frame into `dst` under the render lock — unlike reading
  * display_buf() directly, this can never observe a half-painted frame.
