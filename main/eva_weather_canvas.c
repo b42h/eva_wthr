@@ -459,11 +459,9 @@ static float s_lightning_stroke_t[LIGHTNING_STROKE_MAX];
 static float s_lightning_stroke_k[LIGHTNING_STROKE_MAX];
 #define LIGHTNING_PT_MAX     FIB_21
 #define LIGHTNING_BRANCH_MAX FIB_5
-/* Pre-baked bolt sprite variants packed by tools/cloudgen/genpool.py
- * (range(8) → indices 0-7). Keep in sync with the bolt loop there. */
-#define BOLT_VARIANT_COUNT   8
 /* Glow plane rendered dimmer than the core so the halo doesn't oversaturate
- * to near-white against a bright storm sky (core = full bolt alpha). */
+ * to near-white against a bright storm sky (core = full bolt alpha).
+ * Bolt direction/variant counts live in eva_clp_toc.h (EVA_BOLT_*). */
 #define BOLT_GLOW_SCALE_NUM  3
 #define BOLT_GLOW_SCALE_DEN  4
 static int s_lightning_pt_count;
@@ -4264,105 +4262,65 @@ static void generate_lightning_bolt(void)
      * strikes are flash-only (no visible channel) on EITHER draw path. */
     s_lightning_sheet_only = (rndf(0.0f, 1.0f) < 0.10f);
 
-    /* --- sprite path: pre-baked branched bolt (preferred) --- */
-    int variant = (int)rndf(0.0f, (float)BOLT_VARIANT_COUNT - 0.001f);
-    s_bolt_sprite_ok = eva_cloud_assets_sprite(EVA_CLP_TYPE_BOLT, 0, variant,
-                                               &s_bolt_sprite);
+    /* --- sprite path: pre-baked DIRECTIONAL branched bolt (preferred) ---
+     * Direction is baked into the sprite (subtype). Pick a direction, a random
+     * variant within it, then anchor the sprite so its strike origin lands in a
+     * plausible screen region for that direction. No geometry is computed here;
+     * the whole point of the offline bake is that the device only picks + blits.
+     * Direction indices match BOLT_DIR_NAMES / EVA_BOLT_* constants in
+     * eva_clp_toc.h: 0 down,1 down-left,2 down-right,3 up,4 up-left,
+     * 5 up-right,6 intracloud. */
+    int direction = (int)rndf(0.0f, (float)EVA_BOLT_DIRECTION_COUNT - 0.001f);
+    int variant   = (int)rndf(0.0f, (float)EVA_BOLT_VARIANT_COUNT - 0.001f);
+    s_bolt_sprite_ok = eva_cloud_assets_sprite(EVA_CLP_TYPE_BOLT, direction,
+                                               variant, &s_bolt_sprite);
     if (s_bolt_sprite_ok) {
-        s_bolt_mirror = rndf(0.0f, 1.0f) < 0.5f;
-        s_bolt_x = (int)rndf(0.0f,
-                     (float)(EVA_WEATHER_RENDER_W - s_bolt_sprite.w));
-        /* Anchor slightly above the frame top so the channel's upper end is
-         * hidden in the cloud deck rather than ending at a visible seam. */
-        s_bolt_y = (int)rndf(-40.0f, 20.0f);
-        s_lightning_flash_x = s_bolt_x + s_bolt_sprite.w / 2;
-        s_lightning_flash_y = s_bolt_y + s_bolt_sprite.h / 3;
+        /* Direction is already in the pixels — do NOT horizontal-mirror
+         * (that would turn a down-left into a down-right and break the axis). */
+        s_bolt_mirror = false;
+        const int rw = EVA_WEATHER_RENDER_W;
+        const int rh = EVA_WEATHER_RENDER_H;
+        int sw = s_bolt_sprite.w, sh = s_bolt_sprite.h;
+        /* Horizontal anchor: allow the sprite to span most of the frame width. */
+        s_bolt_x = (int)rndf(-sw * 0.15f, (float)rw - sw * 0.85f);
+        /* Vertical anchor by direction: 'up*' bolts (indices 3,4,5) originate
+         * low, so pull the sprite DOWN so its bright base sits near the deck;
+         * 'intracloud' (6) sits high; others (down*) hang from the top. */
+        if (direction >= 3 && direction <= 5) {
+            s_bolt_y = (int)rndf((float)rh - sh, (float)rh - sh * 0.75f);
+        } else if (direction == 6) {
+            s_bolt_y = (int)rndf(-20.0f, (float)rh * 0.10f);
+        } else {
+            s_bolt_y = (int)rndf(-40.0f, 20.0f);
+        }
+        /* Flash origin = the strike end of the channel for that direction.
+         * For down* / intracloud the strike is near the sprite top; for up* the
+         * strike (ground contact) is near the sprite bottom. */
+        s_lightning_flash_x = s_bolt_x + sw / 2;
+        s_lightning_flash_y = (direction >= 3 && direction <= 5)
+                            ? s_bolt_y + (sh * 2) / 3
+                            : s_bolt_y + sh / 3;
         return;
     }
 
-    /* --- polyline fallback: hand-computed jittered channel (no sprite) --- */
-    float sx, sy, ex, ey;
-    int style = (int)rndf(0.0f, 7.0f);
-
-    switch (style) {
-    case 0: /* classic — cloud base, steep drop */
-        sx = w * rndf(0.18f, 0.82f);
-        sy = h * rndf(0.06f, 0.24f);
-        ex = sx + w * rndf(-0.20f, 0.20f);
-        ey = h * rndf(0.62f, 0.90f);
-        break;
-    case 1: /* top-left → bottom-right */
-        sx = w * rndf(0.02f, 0.24f);
-        sy = h * rndf(0.04f, 0.20f);
-        ex = w * rndf(0.70f, 0.98f);
-        ey = h * rndf(0.58f, 0.92f);
-        break;
-    case 2: /* top-right → lower middle */
-        sx = w * rndf(0.76f, 0.98f);
-        sy = h * rndf(0.04f, 0.22f);
-        ex = w * rndf(0.28f, 0.58f);
-        ey = h * rndf(0.52f, 0.82f);
-        break;
-    case 3: /* random top → random bottom (wide horizontal span) */
-        sx = w * rndf(0.02f, 0.42f);
-        sy = h * rndf(0.05f, 0.26f);
-        ex = w * rndf(0.58f, 0.98f);
-        ey = h * rndf(0.58f, 0.92f);
-        if (rndf(0.0f, 1.0f) < 0.45f) {
-            float tx = sx, ty = sy;
-            sx = ex; sy = ey;
-            ex = tx; ey = ty;
-        }
-        break;
-    case 4: /* bottom → cloud (upward leader) */
-        sx = w * rndf(0.06f, 0.94f);
-        sy = h * rndf(0.66f, 0.92f);
-        ex = sx + w * rndf(-0.28f, 0.28f);
-        ey = h * rndf(0.05f, 0.26f);
-        break;
-    case 5: /* lower-left → upper-right */
-        sx = w * rndf(0.02f, 0.28f);
-        sy = h * rndf(0.62f, 0.90f);
-        ex = w * rndf(0.68f, 0.98f);
-        ey = h * rndf(0.06f, 0.28f);
-        break;
-    default: /* intracloud crawl — upper sky only */
-        sx = w * rndf(0.08f, 0.92f);
-        sy = h * rndf(0.08f, 0.30f);
-        ex = sx + w * rndf(-0.38f, 0.38f);
-        ey = sy + h * rndf(0.04f, 0.24f);
-        if (rndf(0.0f, 1.0f) < 0.20f) {   /* was 0.35 */
-            s_lightning_sheet_only = true;
-        }
-        break;
-    }
-
-    bool cloud_at_end = (ey < sy);
-    float dx = ex - sx;
-    float dy = ey - sy;
+    /* --- polyline fallback: ONLY when the pack has no bolt sprite ---
+     * Minimal single top-down jittered channel; the rich directional look
+     * lives entirely in the baked sprites now. Kept so a corrupt/missing pack
+     * still renders a bolt instead of nothing. */
+    float sx = w * rndf(0.30f, 0.70f);
+    float sy = h * rndf(0.04f, 0.16f);
+    float ex = sx + w * rndf(-0.18f, 0.18f);
+    float ey = h * rndf(0.72f, 0.94f);
+    float dx = ex - sx, dy = ey - sy;
     float seg_len = sqrtf(dx * dx + dy * dy);
-    if (seg_len < 8.0f) {
-        seg_len = 8.0f;
-        dy = (cloud_at_end ? -1.0f : 1.0f) * seg_len;
-        ey = sy + dy;
-        clamp_lightning_xy(&ex, &ey, w, h);
-        dx = ex - sx;
-        dy = ey - sy;
-        seg_len = sqrtf(dx * dx + dy * dy);
-        if (seg_len < 1.0f) seg_len = 1.0f;
-    }
-    float perp_x = -dy / seg_len;
-    float perp_y = dx / seg_len;
-
+    if (seg_len < 1.0f) seg_len = 1.0f;
     s_lightning_pt_count = LIGHTNING_PT_MAX;
     for (int i = 0; i < LIGHTNING_PT_MAX; ++i) {
         float u = (float)i / (float)(LIGHTNING_PT_MAX - 1);
         float px = sx + dx * u;
         float py = sy + dy * u;
         if (i > 0 && i < LIGHTNING_PT_MAX - 1) {
-            float amp = cloud_at_end
-                ? (u * (float)FIB_55 + (float)FIB_13) * 0.85f
-                : ((1.0f - u) * (float)FIB_55 + (float)FIB_13) * 0.85f;
+            float amp = ((1.0f - u) * (float)FIB_55 + (float)FIB_13) * 0.85f;
             px += rndf(-amp, amp);
             py += rndf(-amp * 0.35f, amp * 0.35f);
         }
@@ -4370,40 +4328,10 @@ static void generate_lightning_bolt(void)
         s_lightning_x[i] = (int16_t)px;
         s_lightning_y[i] = (int16_t)py;
     }
-
-    if (sy <= ey) {
-        s_lightning_flash_x = (int16_t)sx;
-        s_lightning_flash_y = (int16_t)sy;
-    } else {
-        s_lightning_flash_x = (int16_t)ex;
-        s_lightning_flash_y = (int16_t)ey;
-    }
-
+    s_lightning_flash_x = (int16_t)sx;
+    s_lightning_flash_y = (int16_t)sy;
     s_lightning_has_branch = false;
     s_lightning_branch_pts = 0;
-    if (!s_lightning_sheet_only && rndf(0.0f, 1.0f) < 0.62f) {
-        int fork = (int)rndf(2.0f, (float)(LIGHTNING_PT_MAX - 4));
-        float bx = (float)s_lightning_x[fork];
-        float by = (float)s_lightning_y[fork];
-        float branch_sign = rndf(0.0f, 1.0f) < 0.5f ? -1.0f : 1.0f;
-        float along = rndf(0.35f, 0.85f);
-        s_lightning_branch_pts = (int)rndf(3.0f, (float)(LIGHTNING_BRANCH_MAX + 1));
-        if (s_lightning_branch_pts > LIGHTNING_BRANCH_MAX) {
-            s_lightning_branch_pts = LIGHTNING_BRANCH_MAX;
-        }
-        for (int j = 0; j < s_lightning_branch_pts; ++j) {
-            bx += perp_x * branch_sign * rndf(8.0f, 28.0f)
-                + (dx / seg_len) * rndf(-6.0f, along * 18.0f);
-            by += perp_y * branch_sign * rndf(6.0f, 22.0f)
-                + (dy / seg_len) * rndf(8.0f, 32.0f);
-            clamp_lightning_xy(&bx, &by, w, h);
-            s_lightning_bx[j] = (int16_t)bx;
-            s_lightning_by[j] = (int16_t)by;
-            branch_sign += rndf(-0.45f, 0.45f);
-            along *= 0.88f;
-        }
-        s_lightning_has_branch = true;
-    }
 }
 
 /* Dart leaders reuse the channel — nudge interior points slightly on later strokes. */
@@ -4698,8 +4626,12 @@ static void composite_lightning_on_render(void)
 
     if (snap.sheet_only || bolt_a < FIB_2) return;
 
-    uint16_t core = rgb565(248, 252, 255);
-    uint16_t glow = rgb565(188, 210, 255);
+    /* Brighter, cooler-white core reads as a hot channel; the glow keeps a
+     * bluish halo. Core is pushed to near-pure white so a thin 1px baked
+     * channel still pops against a bright storm deck (the sprite is thin now,
+     * so brightness—not width—carries legibility). */
+    uint16_t core = rgb565(255, 255, 255);
+    uint16_t glow = rgb565(176, 202, 255);
     if (snap.bolt_sprite_ok) {
         blit_bolt_plane(s_bolt_sprite.plane[1], s_bolt_sprite.w, s_bolt_sprite.h,
                         snap.bolt_x, snap.bolt_y, snap.bolt_mirror,

@@ -137,9 +137,13 @@ def main():
         return size
 
     total_sprites = 0
-    for v in range(8):
-        core, glow = spr.gen_bolt(seed=40 + v)
-        total_sprites += add_sprite(CLP_TYPE_BOLT, 0, v, (core, glow), f"bolt_v{v}.clm")
+    for d in range(spr.BOLT_DIRECTIONS):
+        for v in range(spr.BOLT_VARIANTS_PER_DIR):
+            core, glow = spr.gen_bolt(seed=v, direction=d)
+            # subtype = direction, variant = v  (device keys the sprite this way)
+            total_sprites += add_sprite(CLP_TYPE_BOLT, d, v,
+                                        (core, glow),
+                                        f"bolt_d{d}_v{v}.clm")
     for ph in range(4):
         total_sprites += add_sprite(CLP_TYPE_RAY, ph, 0, (spr.gen_rays(ph),), f"ray_p{ph}.clm")
     for ph in range(spr.MOON_PHASE_COUNT):

@@ -157,24 +157,50 @@ def test_spiffs_pool_if_present():
         assert p["cover_min"] <= cov <= p["cover_max"] + 0.10, \
             f"{base}: coverage {cov:.2f} out of range"
 
-def test_bolt_sprite():
+def test_bolt_sprites():
     import sprites
-    for v in range(3):
-        core, glow = sprites.gen_bolt(seed=40 + v)
-        assert core.shape == (560, 360) and core.dtype == np.uint8
-        assert glow.shape == core.shape
-        # Main channel connectivity: every row between the first and last
-        # populated row has at least one core pixel (unbroken top->bottom).
-        rows = np.where(core.max(axis=1) > 40)[0]
-        assert rows.size > 400, "channel too short"
-        full = np.arange(rows.min(), rows.max() + 1)
-        populated = set(rows.tolist())
-        gaps = [r for r in full if r not in populated]
-        assert not gaps, f"channel broken at rows {gaps[:5]}"
-        # Branching exists but doesn't flood the sprite.
-        cov = (core > 20).mean()
-        assert 0.005 < cov < 0.10, f"core coverage {cov:.3f}"
-        assert (glow > 8).mean() > cov, "glow must be wider than core"
+    n_dir = sprites.BOLT_DIRECTIONS
+    n_var = sprites.BOLT_VARIANTS_PER_DIR
+    assert n_dir >= 6 and n_var >= 3, "need >=6 directions, >=3 variants"
+    prev = None
+    for d in range(n_dir):
+        for v in range(n_var):
+            core, glow = sprites.gen_bolt(seed=v, direction=d)
+            assert core.shape == (560, 360) and glow.shape == (560, 360)
+            lit = (core > 40)
+            frac = lit.mean()
+            # THIN: a bolt lights well under 4% of the frame (old walker was fatter)
+            assert 0.001 < frac < 0.04, f"dir{d} var{v}: lit frac {frac:.4f} out of range"
+            # BRANCHED: at several row-bands the channel appears at >1 disjoint x
+            # (a plain line would have exactly one run per row). Count rows with
+            # >=2 separated lit runs; a tree has many.
+            multi = 0
+            for row in range(0, 560, 8):
+                xs = np.where(lit[row])[0]
+                if len(xs) >= 2 and (np.diff(xs) > 3).sum() >= 1:
+                    multi += 1
+            assert multi >= 3, f"dir{d} var{v}: not tree-like (multi-branch rows={multi})"
+            # GLOW is wider than core (soft halo), so glow lights strictly more px
+            assert (glow > 40).sum() > lit.sum(), f"dir{d} var{v}: glow not wider than core"
+            # DISTINCT: different (dir,var) must not be identical
+            if prev is not None:
+                assert not np.array_equal(core, prev), "bolts must differ"
+            prev = core
+    # DIRECTIONALITY: 'down' variants have their brightest mass in the top half
+    # of the frame near x-center-ish; 'up' variants in the bottom half. We only
+    # assert the vertical center-of-mass ordering between a down dir and an up
+    # dir to prove direction is actually baked in.
+    dirs = sprites.BOLT_DIR_NAMES
+    def ycom(core):
+        ys, xs = np.where(core > 40)
+        return ys.mean()
+    di = dirs.index("down")
+    ui = dirs.index("up")
+    down_com = ycom(sprites.gen_bolt(seed=0, direction=di)[0])
+    up_com   = ycom(sprites.gen_bolt(seed=0, direction=ui)[0])
+    # 'down' bolt starts at top and thins downward via branches near the strike
+    # point; 'up' is mirrored. They must differ meaningfully in vertical COM.
+    assert abs(down_com - up_com) > 20, f"down/up COM too close: {down_com:.0f} vs {up_com:.0f}"
 
 def test_ray_sprite_phases():
     import sprites
@@ -269,7 +295,7 @@ def run_all():
     test_mid_unchanged_formula()
     test_clm_roundtrip()
     test_spiffs_pool_if_present()
-    test_bolt_sprite()
+    test_bolt_sprites()
     test_ray_sprite_phases()
     test_moon_phases_monotonic()
     test_drop_sprites()

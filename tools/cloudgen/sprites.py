@@ -17,72 +17,99 @@ def _a8(m):
     return (np.clip(m, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
 
 # --- lightning -------------------------------------------------------------
+#
+# Fractal midpoint-displacement bolt. A start->end segment (whose direction is
+# chosen by `direction`) is recursively subdivided; each midpoint is pushed
+# perpendicular by a decaying random offset, giving the sharp self-similar zig
+# of real lightning. Branches fork off endpoints at shallow recursion depth and
+# are themselves subdivided with decayed displacement + intensity. Core is
+# rasterized 1px THIN; the wide read comes from the separate blurred `glow`
+# plane, not a fat core. Direction is BAKED so the device just picks a cached
+# sprite by (subtype=direction, variant=seed) — no runtime geometry.
 
-BOLT_BRANCH_PROB = 0.045      # chance per walker step to spawn a side branch
-BOLT_BRANCH_LEN = (18, 70)    # branch length range in steps, before depth decay
-BOLT_BRANCH_DEPTH_MAX = 3     # branches stop spawning sub-branches past this depth
-BOLT_BRANCH_LEN_DECAY = 0.7   # per-depth-level shrink of BOLT_BRANCH_LEN
+BOLT_DIR_NAMES = ["down", "down_left", "down_right", "up", "up_left", "up_right", "intracloud"]
+BOLT_DIRECTIONS = len(BOLT_DIR_NAMES)
+BOLT_VARIANTS_PER_DIR = 4
+BOLT_SUBDIV_DEPTH = 6         # 2^6 = 64 base segments along the trunk
+BOLT_BRANCH_PROB = 0.16       # per trunk segment-endpoint chance to fork
+BOLT_BRANCH_DEPTH_MAX = 2     # branches may spawn sub-branches up to here
 
-def gen_bolt(seed, w=360, h=560):
-    """Branched bolt via a biased random walker: a main channel descends the
-    full height with lateral jitter; side branches split off with decaying
-    intensity and die early. Core = sharp channel, glow = blurred halo.
+def _bolt_endpoints(rng, direction, w, h):
+    """Return (sx,sy,ex,ey) for a named direction, in pixels. 'down' enters top,
+    exits bottom; 'up' is vertically mirrored; *_left/right add horizontal span;
+    'intracloud' is a shallow horizontal crawl in the upper sky."""
+    name = BOLT_DIR_NAMES[direction]
+    if name == "down":
+        return (w*rng.uniform(0.4,0.6), 0.0,        w*rng.uniform(0.4,0.6), h*rng.uniform(0.9,1.0))
+    if name == "down_left":
+        return (w*rng.uniform(0.7,0.95), 0.0,       w*rng.uniform(0.05,0.3), h*rng.uniform(0.85,1.0))
+    if name == "down_right":
+        return (w*rng.uniform(0.05,0.3), 0.0,       w*rng.uniform(0.7,0.95), h*rng.uniform(0.85,1.0))
+    if name == "up":
+        return (w*rng.uniform(0.4,0.6), h*1.0,       w*rng.uniform(0.4,0.6), h*rng.uniform(0.0,0.1))
+    if name == "up_left":
+        return (w*rng.uniform(0.7,0.95), h*1.0,      w*rng.uniform(0.05,0.3), h*rng.uniform(0.0,0.15))
+    if name == "up_right":
+        return (w*rng.uniform(0.05,0.3), h*1.0,      w*rng.uniform(0.7,0.95), h*rng.uniform(0.0,0.15))
+    # intracloud: shallow near-horizontal crawl high in the frame
+    y0 = h*rng.uniform(0.08, 0.30)
+    return (w*rng.uniform(0.05,0.25), y0,            w*rng.uniform(0.75,0.95), y0 + h*rng.uniform(0.02,0.12))
 
-    `walk()` deposits every point it visits straight into `core` (rather
-    than buffering into a list the caller merges), so a branch that itself
-    spawns a depth-2/3 sub-branch has that sub-branch actually rendered —
-    an earlier version buffered sub-branch points into a list nobody read,
-    silently dropping anything past depth 1."""
-    rng = np.random.default_rng(seed)
-    core = np.zeros((h, w))
+def _subdivide(rng, x0, y0, x1, y1, disp, depth, out):
+    if depth == 0:
+        out.append((x0, y0, x1, y1))
+        return
+    mx, my = (x0+x1)*0.5, (y0+y1)*0.5
+    dx, dy = x1-x0, y1-y0
+    L = (dx*dx + dy*dy) ** 0.5 + 1e-6
+    nx, ny = -dy/L, dx/L
+    off = rng.normal(0.0, disp)
+    mx += nx*off; my += ny*off
+    _subdivide(rng, x0, y0, mx, my, disp*0.55, depth-1, out)
+    _subdivide(rng, mx, my, x1, y1, disp*0.55, depth-1, out)
 
-    def deposit(x, y, intensity):
-        px, py = int(x), int(y)
-        core[py, px] = max(core[py, px], intensity)
-        if intensity > 0.5:          # main channel is 2 px wide
-            core[py, min(px + 1, w - 1)] = max(core[py, min(px + 1, w - 1)], intensity * 0.8)
+def _rasterize(core, x0, y0, x1, y1, intensity):
+    h, w = core.shape
+    n = int(((x1-x0)**2 + (y1-y0)**2) ** 0.5) + 1
+    for i in range(n):
+        t = i / max(n-1, 1)
+        xi = int(min(max(x0 + (x1-x0)*t, 0), w-1))
+        yi = int(min(max(y0 + (y1-y0)*t, 0), h-1))
+        if intensity > core[yi, xi]:
+            core[yi, xi] = intensity
 
-    def walk(x, y, intensity, max_len, depth):
-        n = 0
-        while y < h - 2 and n < max_len and intensity > 0.08:
-            deposit(x, y, intensity)
-            y += rng.uniform(1.2, 3.2)
-            x += rng.normal(0.0, 2.6) + rng.uniform(-0.6, 0.6)
-            x = float(np.clip(x, 4, w - 5))
-            n += 1
-            if depth < BOLT_BRANCH_DEPTH_MAX and rng.random() < BOLT_BRANCH_PROB:
-                bx = x + rng.normal(0.0, 2.0)
-                blen = int(rng.uniform(*BOLT_BRANCH_LEN) *
-                          (BOLT_BRANCH_LEN_DECAY ** depth))
-                walk(bx, y, intensity * rng.uniform(0.35, 0.6), blen, depth + 1)
-            intensity *= 0.995        # branches fade as they run
-
-    # Main trunk: force it to keep going until it reaches near the bottom,
-    # regardless of intensity decay (branches are separate, shorter walks
-    # spawned via the same `walk()` at depth 1).
-    x, y = rng.uniform(w * 0.3, w * 0.7), 0.0
-    while y < h - 2:
-        deposit(x, y, 1.0)
-        y += rng.uniform(1.2, 3.2)
-        x += rng.normal(0.0, 2.6) + rng.uniform(-0.6, 0.6)
-        x = float(np.clip(x, 4, w - 5))
+def gen_bolt(seed, direction=0, w=360, h=560):
+    """Fractal branched bolt for one (direction, seed). Returns (core, glow) A8.
+    Direction is one of BOLT_DIR_NAMES indices; the device keys the sprite by
+    (subtype=direction, variant=seed) and never recomputes geometry at runtime."""
+    import math
+    rng = np.random.default_rng(1000 + direction*97 + seed)
+    core = np.zeros((h, w), np.float64)
+    sx, sy, ex, ey = _bolt_endpoints(rng, direction, w, h)
+    trunk = []
+    _subdivide(rng, sx, sy, ex, ey, disp=h*0.06, depth=BOLT_SUBDIV_DEPTH, out=trunk)
+    for (x0, y0, x1, y1) in trunk:
+        _rasterize(core, x0, y0, x1, y1, 1.0)
+    # branches off trunk endpoints
+    def maybe_branch(px, py, base_ang, depth):
+        if depth > BOLT_BRANCH_DEPTH_MAX:
+            return
+        ang = base_ang + rng.uniform(-0.9, 0.9)
+        blen = rng.uniform(0.10, 0.28) * h * (0.6 ** (depth-1))
+        bx, by = px + math.cos(ang)*blen, py + math.sin(ang)*blen
+        segs = []
+        _subdivide(rng, px, py, bx, by, disp=blen*0.20, depth=4, out=segs)
+        inten = rng.uniform(0.45, 0.7) * (0.7 ** (depth-1))
+        for (a, b, c, d) in segs:
+            _rasterize(core, a, b, c, d, inten)
+        # sub-branch
         if rng.random() < BOLT_BRANCH_PROB:
-            bx = x + rng.normal(0.0, 2.0)
-            blen = int(rng.uniform(*BOLT_BRANCH_LEN))
-            walk(bx, y, rng.uniform(0.35, 0.6), blen, 1)
-
-    # Guarantee row continuity of the main channel: fill any skipped rows
-    # by interpolating between neighbours (walker can jump 3 rows).
-    ys = np.where(core.max(axis=1) > 0.5)[0]
-    for y0, y1 in zip(ys[:-1], ys[1:]):
-        if y1 - y0 > 1:
-            x0 = core[y0].argmax(); x1 = core[y1].argmax()
-            for yy in range(y0 + 1, y1):
-                t = (yy - y0) / (y1 - y0)
-                xi = int(round(x0 + (x1 - x0) * t))
-                xi = int(np.clip(xi, 0, w - 1))
-                core[yy, xi] = 1.0
-    glow = _blur(core, passes=3, k=9) * 3.0
+            maybe_branch(bx, by, ang, depth+1)
+    for (x0, y0, x1, y1) in trunk:
+        if rng.random() < BOLT_BRANCH_PROB:
+            base = math.atan2(y1-y0, x1-x0)
+            maybe_branch(x1, y1, base, 1)
+    glow = _blur(core, passes=3, k=9) * 2.6
     return _a8(core), _a8(glow)
 
 # --- sun rays ---------------------------------------------------------------

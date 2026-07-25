@@ -18,13 +18,13 @@ typedef struct {
     uint32_t size;
 } eva_clp_entry_t;
 
-/* Pack now carries 30 cloud entries (normal/storm/merged/lit pools) + 97
- * sprite entries (bolt/ray/moon(32)/drop/trail + 32 rain + 1 fog + 32 sky)
- * = 127 (was 126 with an 8-phase moon; moon went 8 -> 32 phases 2026-07-18
- * to cut phase-quantization error, see EVA_MOON_PHASE_COUNT below).
- * Cap set to 160 for headroom. The pack builder (tools/cloudgen/genpool.py)
- * currently emits 127; if you add asset variants, keep this above the count
- * or eva_clp_parse() rejects the WHOLE pack -> procedural fallback everywhere. */
+/* Pack now carries 30 cloud entries (normal/storm/merged/lit pools) + ~87
+ * sprite entries (bolt 7×4 / ray / moon(32) / drop / trail + rain + fog + sky)
+ * = 117 (was 127 with 8 vertical-only bolts; bolts went to a directional
+ * 7×4 pool 2026-07-19, see EVA_BOLT_* below). Cap set to 160 for headroom.
+ * The pack builder (tools/cloudgen/genpool.py) currently emits 117; if you
+ * add asset variants, keep this above the count or eva_clp_parse() rejects
+ * the WHOLE pack -> procedural fallback everywhere. */
 #define EVA_CLP_MAX_ENTRIES 160
 
 #define EVA_CLP_TYPE_CLOUD 0   /* light/shadow/core cloud mask (as CLP1) */
@@ -41,6 +41,14 @@ typedef struct {
  * MOON_PHASE_COUNT, tools/cloudgen/genpool.py). Must match exactly — the
  * canvas quantizes moon_phase_pct (0..100) to a phase index using this. */
 #define EVA_MOON_PHASE_COUNT 32
+
+/* Baked lightning bolts: EVA_BOLT_DIRECTION_COUNT directions (subtype axis:
+ * 0=down 1=down-left 2=down-right 3=up 4=up-left 5=up-right 6=intracloud, see
+ * BOLT_DIR_NAMES in tools/cloudgen/sprites.py) × EVA_BOLT_VARIANT_COUNT random
+ * variants (variant axis). Device picks a cached sprite by (subtype,variant);
+ * it never generates bolt geometry. Keep both in sync with sprites.py. */
+#define EVA_BOLT_DIRECTION_COUNT 7
+#define EVA_BOLT_VARIANT_COUNT   4
 
 typedef struct {
     eva_clp_entry_t entries[EVA_CLP_MAX_ENTRIES];
