@@ -15,7 +15,6 @@ extern "C" {
 #define EVA_WEATHER_CANVAS_W 800
 #define EVA_WEATHER_CANVAS_H 480
 
-lv_obj_t *eva_weather_canvas_init(lv_obj_t *parent);
 void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel);
 void eva_weather_canvas_set_kind(weather_kind_t kind);
 void eva_weather_canvas_set_weather(const weather_state_t *st);
@@ -58,6 +57,11 @@ uint32_t eva_weather_canvas_last_tick_hz(void);
 /* Last frame's render work time in microseconds (render_weather +
  * upscale combined). Useful as an FPS-independent measure of pipeline load. */
 uint32_t eva_weather_canvas_last_work_us(void);
+
+/* Frames in the last log window where the panel was still scanning after
+ * 40 ms and the buffer swap had to be skipped. Non-zero means the scene is
+ * slower than the panel hand-back; the frame still counts toward FPS. */
+uint32_t eva_weather_canvas_last_vsync_timeouts(void);
 
 void eva_weather_canvas_last_breakdown_us(uint32_t *bg_us, uint32_t *cloud_us,
                                           uint32_t *particle_us, uint32_t *lightning_us,

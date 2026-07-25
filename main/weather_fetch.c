@@ -13,8 +13,8 @@
  *   weather_code, kind, temp, wind, precip, sunshine
  *     → open-meteo always
  *   cloud_cover_pct, cloud_low/mid/high_pct, sun, moon, visibility, fog
- *     → clearoutside if fresh (last success < 2*cadence), else open-meteo
- *       or hardcoded fallback
+ *     → clearoutside if fresh (last success < 3*cadence, mono clock), else
+ *       open-meteo or hardcoded fallback
  *
  * User decision 2026-05-25: clearoutside owns ALL cloud fields because its
  * layer breakdown + "Total Clouds (% Sky Obscured)" metric match what we
@@ -26,8 +26,10 @@
 #include "weather_fetch_openmeteo.h"
 #include "weather_fetch_clearoutside.h"
 #include "eva_weather.h"
+#include "eva_weather_freshness.h"
 #include "eva_wifi.h"
 
+#include <stdio.h>
 #include <string.h>
 #include <sys/time.h>
 #include "esp_log.h"
@@ -50,8 +52,11 @@ static const char *TAG = "weather_fetch";
 #define MAX_RETRIES                3
 #define FIRST_FETCH_DELAY_MS       (15 * 1000)
 
-/* "Fresh" window for secondary fields: 2 * cadence. */
-#define CLEAROUTSIDE_FRESH_SEC     (2 * CLEAROUTSIDE_INTERVAL_MIN * 60)
+/* "Fresh" window for secondary fields: 3 * cadence (A-11: max gap 202 min
+ * exceeds 2×cadence=178 min). Checked on monotonic time so wall-clock jumps
+ * from settimeofday cannot flip a just-fetched sample stale. */
+#define CLEAROUTSIDE_FRESH_SEC     (3 * CLEAROUTSIDE_INTERVAL_MIN * 60)
+#define CLEAROUTSIDE_FRESH_US      ((int64_t)CLEAROUTSIDE_FRESH_SEC * 1000000LL)
 
 typedef enum {
     JOB_OPENMETEO,
@@ -66,9 +71,11 @@ static QueueHandle_t      s_job_queue;
 static SemaphoreHandle_t  s_state_mutex;
 static bool               s_wifi_ready_delay_done = false;
 
-/* Per-source provenance */
+/* Per-source provenance — epoch for user-facing status, mono for freshness. */
 static int64_t s_last_ok_openmeteo    = 0;
 static int64_t s_last_ok_clearoutside = 0;
+static int64_t s_last_ok_openmeteo_mono    = 0;
+static int64_t s_last_ok_clearoutside_mono = 0;
 static int     s_retries_openmeteo    = 0;
 static int     s_retries_clearoutside = 0;
 static bool    s_retrying_openmeteo   = false;
@@ -89,8 +96,10 @@ static int64_t now_epoch_sec(void)
 
 static bool clearoutside_is_fresh(void)
 {
-    if (!s_have_clearoutside) return false;
-    return (now_epoch_sec() - s_last_ok_clearoutside) < CLEAROUTSIDE_FRESH_SEC;
+    return eva_provider_is_fresh_mono(s_have_clearoutside,
+                                      s_last_ok_clearoutside_mono,
+                                      (int64_t)esp_timer_get_time(),
+                                      CLEAROUTSIDE_FRESH_US);
 }
 
 static void queue_job(job_kind_t kind)
@@ -118,9 +127,13 @@ static bool wait_for_wifi_ready(void)
     return true;
 }
 
-/* Merge the two latest partials into the canonical weather_state_t and
- * apply it. Always called with s_state_mutex held. */
-static void merge_and_apply(void)
+/* Merge snapshotted partials into the canonical weather_state_t and publish.
+ * Must NOT be called with s_state_mutex held — eva_weather_set takes
+ * s_weather_lock and reaches into the canvas (s_render_lock). */
+static void merge_and_apply(const weather_partial_t *om, bool have_om,
+                            const weather_partial_t *co, bool have_co,
+                            bool co_fresh,
+                            int64_t om_epoch_ts, int64_t co_epoch_ts)
 {
     weather_state_t st = {0};
     /* Pull baseline from current canonical state so we keep fields neither
@@ -128,12 +141,8 @@ static void merge_and_apply(void)
     const weather_state_t *cur = eva_weather_get();
     if (cur) memcpy(&st, cur, sizeof(st));
 
-    const weather_partial_t *om = s_have_openmeteo ? &s_last_openmeteo : NULL;
-    const weather_partial_t *co = s_have_clearoutside ? &s_last_clearoutside : NULL;
-    bool co_fresh = clearoutside_is_fresh();
-
     /* --- open-meteo wins for non-cloud lifestyle fields --- */
-    if (om) {
+    if (have_om && om) {
         if (om->has_kind) {
             st.kind = om->kind;
             st.weather_code = om->weather_code;
@@ -160,13 +169,13 @@ static void merge_and_apply(void)
      * its per-layer breakdown and the "Total Clouds (% Sky Obscured)" metric
      * match what we render. open-meteo's cloud_cover is fallback when
      * clearoutside is stale or has never succeeded. */
-    if (co && co_fresh && co->has_clouds) {
+    if (have_co && co && co_fresh && co->has_clouds) {
         st.cloud_low_pct   = co->cloud_low_pct;
         st.cloud_mid_pct   = co->cloud_mid_pct;
         st.cloud_high_pct  = co->cloud_high_pct;
         st.cloud_total_pct = co->cloud_cover_pct;   /* clearoutside "Total Clouds" */
         st.cloud_cover_pct = co->cloud_cover_pct;   /* drives sky_cover_fraction() */
-    } else if (om && om->has_clouds) {
+    } else if (have_om && om && om->has_clouds) {
         st.cloud_low_pct   = om->cloud_low_pct;
         st.cloud_mid_pct   = om->cloud_mid_pct;
         st.cloud_high_pct  = om->cloud_high_pct;
@@ -175,17 +184,17 @@ static void merge_and_apply(void)
     }
 
     /* Sun: clearoutside wins when fresh, else open-meteo */
-    if (co && co_fresh && co->has_sun) {
+    if (have_co && co && co_fresh && co->has_sun) {
         st.sunrise_min = co->sunrise_min;
         st.sunset_min  = co->sunset_min;
-    } else if (om && om->has_sun) {
+    } else if (have_om && om && om->has_sun) {
         st.sunrise_min = om->sunrise_min;
         st.sunset_min  = om->sunset_min;
     }
 
     /* Moon: clearoutside only. If stale, keep whatever was in canonical state.
      * If never populated, hardcoded fallback (50%, waxing). */
-    if (co && co_fresh && co->has_moon) {
+    if (have_co && co && co_fresh && co->has_moon) {
         st.moonrise_min   = co->moonrise_min;
         st.moonset_min    = co->moonset_min;
         st.moon_phase_pct = co->moon_phase_pct;
@@ -197,14 +206,14 @@ static void merge_and_apply(void)
     }
 
     /* Visibility / fog: clearoutside wins when fresh */
-    if (co && co_fresh && co->has_visibility) {
+    if (have_co && co && co_fresh && co->has_visibility) {
         st.visibility_km_x10 = (uint8_t)(co->visibility_km_x10 > 255 ? 255 : co->visibility_km_x10);
         st.fog_pct           = co->fog_pct;
     }
 
-    /* Provenance timestamps */
-    st.openmeteo_ts    = s_last_ok_openmeteo;
-    st.clearoutside_ts = s_last_ok_clearoutside;
+    /* Provenance timestamps (epoch — for status display) */
+    st.openmeteo_ts    = om_epoch_ts;
+    st.clearoutside_ts = co_epoch_ts;
     st.fetched_at      = (time_t)now_epoch_sec();
 
     /* Ukrainian description from kind */
@@ -218,6 +227,29 @@ static void merge_and_apply(void)
         return;
     }
     eva_weather_set(&st);
+}
+
+/* Snapshot provider state under the mutex, then merge+publish unlocked. */
+static void snapshot_and_merge(void)
+{
+    weather_partial_t om = {0}, co = {0};
+    bool have_om = false, have_co = false, co_fresh = false;
+    int64_t om_ts = 0, co_ts = 0;
+
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    have_om = s_have_openmeteo;
+    have_co = s_have_clearoutside;
+    if (have_om) om = s_last_openmeteo;
+    if (have_co) co = s_last_clearoutside;
+    om_ts = s_last_ok_openmeteo;
+    co_ts = s_last_ok_clearoutside;
+    co_fresh = clearoutside_is_fresh();
+    xSemaphoreGive(s_state_mutex);
+
+    if (!have_om && !have_co) return;
+    merge_and_apply(have_om ? &om : NULL, have_om,
+                    have_co ? &co : NULL, have_co,
+                    co_fresh, om_ts, co_ts);
 }
 
 static volatile bool s_weather_pinned;
@@ -238,6 +270,7 @@ static void run_job(job_kind_t kind)
 {
     weather_partial_t p;
     esp_err_t err;
+    bool apply = false;
 
     if (kind == JOB_OPENMETEO) {
         ESP_LOGI(TAG, "open-meteo fetch start");
@@ -249,27 +282,30 @@ static void run_job(job_kind_t kind)
 
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     if (err == ESP_OK) {
+        int64_t mono = (int64_t)esp_timer_get_time();
         if (kind == JOB_OPENMETEO) {
             memcpy(&s_last_openmeteo, &p, sizeof(p));
-            s_have_openmeteo        = true;
-            s_last_ok_openmeteo     = now_epoch_sec();
-            s_retries_openmeteo     = 0;
-            s_retrying_openmeteo    = false;
+            s_have_openmeteo           = true;
+            s_last_ok_openmeteo        = now_epoch_sec();
+            s_last_ok_openmeteo_mono   = mono;
+            s_retries_openmeteo        = 0;
+            s_retrying_openmeteo       = false;
             esp_timer_stop(s_retry_t_openmeteo);
             ESP_LOGI(TAG, "open-meteo ok code=%d cover=%u%% temp=%dC",
                      p.weather_code, p.cloud_cover_pct, (int)p.temp_c);
         } else {
             memcpy(&s_last_clearoutside, &p, sizeof(p));
-            s_have_clearoutside        = true;
-            s_last_ok_clearoutside     = now_epoch_sec();
-            s_retries_clearoutside     = 0;
-            s_retrying_clearoutside    = false;
+            s_have_clearoutside           = true;
+            s_last_ok_clearoutside        = now_epoch_sec();
+            s_last_ok_clearoutside_mono   = mono;
+            s_retries_clearoutside        = 0;
+            s_retrying_clearoutside       = false;
             esp_timer_stop(s_retry_t_clearoutside);
             ESP_LOGI(TAG, "clearoutside ok L=%u%% M=%u%% H=%u%% moon=%u%%",
                      p.cloud_low_pct, p.cloud_mid_pct, p.cloud_high_pct,
                      p.moon_phase_pct);
         }
-        merge_and_apply();
+        apply = true;
     } else {
         int            *retries  = (kind == JOB_OPENMETEO) ? &s_retries_openmeteo   : &s_retries_clearoutside;
         bool           *retrying = (kind == JOB_OPENMETEO) ? &s_retrying_openmeteo  : &s_retrying_clearoutside;
@@ -291,6 +327,8 @@ static void run_job(job_kind_t kind)
         }
     }
     xSemaphoreGive(s_state_mutex);
+
+    if (apply) snapshot_and_merge();
 }
 
 static void worker_task(void *arg)
@@ -369,11 +407,7 @@ void weather_fetch_request(void)
 void weather_fetch_reapply_cached(void)
 {
     if (!s_state_mutex) return;
-    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
-    if (s_have_openmeteo || s_have_clearoutside) {
-        merge_and_apply();
-    }
-    xSemaphoreGive(s_state_mutex);
+    snapshot_and_merge();
 }
 
 int64_t weather_fetch_openmeteo_last_ts(void)    { return s_last_ok_openmeteo; }

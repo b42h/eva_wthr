@@ -2,10 +2,12 @@
 #include "weather_provider.h"
 
 #include <ctype.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+#include "sdkconfig.h"
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -29,7 +31,12 @@
  * We always read the first <li> (h0) which corresponds to the current hour
  * because the page auto-centres on the request time. */
 
-#define WEATHER_URL "http://clearoutside.com/forecast/48.91/24.71"
+/* clearoutside routes by 2-decimal coordinates in the path; more precision
+ * just 404s. Build the URL at runtime from the same menuconfig values
+ * open-meteo uses (CONFIG_EVA_WEATHER_LATITUDE / _LONGITUDE) so both
+ * providers always describe the same place — a mismatch here would merge
+ * two different cities into one scene. */
+#define WEATHER_URL_MAX 96
 #define WEATHER_REFRESH_MS (13 * 60 * 1000)
 #define WEATHER_RETRY_MS   (60 * 1000)
 #define WEATHER_FIRST_FETCH_DELAY_MS (15 * 1000)
@@ -37,10 +44,29 @@
 
 static const char *TAG = "weather_clearoutside";
 
+/* "48.915155" -> "48.91". Copies at most two fractional digits; a value with
+ * no '.' is passed through unchanged. Always NUL-terminates. */
+static void coord_2dp(const char *src, char *dst, size_t dst_sz)
+{
+    size_t i = 0;
+    const char *dot = strchr(src, '.');
+    size_t keep = dot ? (size_t)(dot - src) + 3 : strlen(src);
+    while (i < keep && src[i] && i + 1 < dst_sz) {
+        dst[i] = src[i];
+        i++;
+    }
+    dst[i] = '\0';
+}
+
 static char *http_get_body(size_t *out_len)
 {
+    char lat[16], lon[16], url[WEATHER_URL_MAX];
+    coord_2dp(CONFIG_EVA_WEATHER_LATITUDE, lat, sizeof(lat));
+    coord_2dp(CONFIG_EVA_WEATHER_LONGITUDE, lon, sizeof(lon));
+    snprintf(url, sizeof(url), "http://clearoutside.com/forecast/%s/%s", lat, lon);
+
     esp_http_client_config_t cfg = {
-        .url = WEATHER_URL,
+        .url = url,
         .timeout_ms = 15000,
         .buffer_size = 4096,
         .buffer_size_tx = 1024,
@@ -59,6 +85,13 @@ static char *http_get_body(size_t *out_len)
     }
 
     int content_len = esp_http_client_fetch_headers(client);
+    int status = esp_http_client_get_status_code(client);
+    if (status != 200) {
+        ESP_LOGW(TAG, "HTTP status %d (want 200)", status);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return NULL;
+    }
     if (content_len > WEATHER_HTTP_MAX_BYTES) {
         ESP_LOGW(TAG, "body too large: %d", content_len);
         esp_http_client_close(client);
@@ -86,7 +119,12 @@ static char *http_get_body(size_t *out_len)
     esp_http_client_cleanup(client);
 
     if (total <= 0) {
-        free(body);
+        heap_caps_free(body);
+        return NULL;
+    }
+    if (content_len > 0 && total < content_len) {
+        ESP_LOGW(TAG, "truncated body: got %d of %d", total, content_len);
+        heap_caps_free(body);
         return NULL;
     }
     if (out_len) *out_len = (size_t)total;
@@ -460,7 +498,7 @@ static bool fetch_into(weather_state_t *out)
     ESP_LOGI(TAG, "downloaded %u bytes", (unsigned)len);
 
     bool ok = scrape(body, out);
-    free(body);
+    heap_caps_free(body);
     return ok;
 }
 

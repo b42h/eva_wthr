@@ -542,6 +542,13 @@ static int64_t s_prof_lightning_us;
 static int64_t s_prof_glass_us;
 static uint32_t s_prof_blend_bands;    /* PPA band blends this log window */
 static uint32_t s_prof_morph_frames;   /* frames with ≥1 layer morphing */
+/* Frames where the panel was still scanning after 40 ms, so the buffer swap
+ * was skipped. Non-zero means the scene renders slower than the panel can
+ * hand back a buffer (fog is the usual suspect). Reported by CDC `perf`.
+ * s_last_* holds the value of the most recent log window, since the live
+ * counter resets every LOG_EVERY_FRAMES. */
+static uint32_t s_vsync_timeouts;
+static uint32_t s_last_vsync_timeouts;
 static char s_clock_text[16] = "00:00";
 static char s_date_text[24] = "";
 static char s_temp_text[16] = "+0C";
@@ -5146,6 +5153,11 @@ void eva_weather_canvas_last_breakdown_us(uint32_t *bg_us, uint32_t *cloud_us,
     if (vsync_us) *vsync_us = s_last_vsync_us;
 }
 
+uint32_t eva_weather_canvas_last_vsync_timeouts(void)
+{
+    return s_last_vsync_timeouts;
+}
+
 void eva_weather_canvas_cloud_budget(uint16_t *active, uint16_t *max)
 {
     if (active) *active = s_clouds3d_active;
@@ -5521,13 +5533,22 @@ static void native_render_task(void *arg)
             continue;
         }
         int64_t t_draw = esp_timer_get_time();
-        (void)xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(40));
+        /* Wait for the panel to finish scanning before reusing the buffer.
+         * On timeout we must NOT swap (the next frame would write into an
+         * in-scan framebuffer) — but the frame still happened, so it keeps
+         * counting toward perf/adapt_budget below. Dropping it from the
+         * stats would hide exactly the scenes that time out most (fog). */
+        bool vsync_ok = xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(40)) == pdTRUE;
         int64_t t_vsync = esp_timer_get_time();
         (void)t_draw;
 
-        uint16_t *old_scan = s_dpi_scan_fb;
-        s_dpi_scan_fb = s_dpi_back_fb;
-        s_dpi_back_fb = old_scan;
+        if (vsync_ok) {
+            uint16_t *old_scan = s_dpi_scan_fb;
+            s_dpi_scan_fb = s_dpi_back_fb;
+            s_dpi_back_fb = old_scan;
+        } else {
+            s_vsync_timeouts++;
+        }
 
         s_last_frame_us = t_rotate - t0;
         adapt_budget(s_last_frame_us);
@@ -5550,13 +5571,14 @@ static void native_render_task(void *arg)
             uint32_t rot_avg    = (uint32_t)(prof_rotate_us      / s_frames);
             uint32_t vsync_avg  = (uint32_t)(s_accum_lvgl_slot_us / s_frames);
             uint32_t clb_avg    = (uint32_t)(s_prof_blend_bands  / s_frames);
-            ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u tx=%u cl=%u pa=%u li=%u gl=%u ppa_rot=%u lvgl=0 vsync=%u clb=%u mfr=%u) jitter=%u..%u",
+            ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u tx=%u cl=%u pa=%u li=%u gl=%u ppa_rot=%u lvgl=0 vsync=%u clb=%u mfr=%u vst=%u) jitter=%u..%u",
                      weather_kind_name(s_kind), (unsigned)tick_hz,
                      (unsigned)s_target, (unsigned)s_max_target,
                      (unsigned)s_clouds3d_active, (unsigned)CLOUD_3D_MAX,
                      (unsigned)avg,
                      bg_avg, tx_avg, cl_avg, pa_avg, li_avg, gl_avg, rot_avg, vsync_avg,
                      clb_avg, (unsigned)s_prof_morph_frames,
+                     (unsigned)s_vsync_timeouts,
                      (unsigned)tick_min, (unsigned)tick_max);
             tick_min = 1000000; tick_max = 0;
             s_last_tick_hz = tick_hz;
@@ -5579,200 +5601,13 @@ static void native_render_task(void *arg)
             s_prof_glass_us = 0;
             s_prof_blend_bands = 0;
             s_prof_morph_frames = 0;
+            s_last_vsync_timeouts = s_vsync_timeouts;
+            s_vsync_timeouts = 0;
             prof_rotate_us = 0;
         }
 
         s_last_tick_exit_us = esp_timer_get_time();
     }
-}
-
-static void canvas_tick(lv_timer_t *timer)
-{
-    (void)timer;
-    static int64_t prof_upscale_us = 0; /* Kept for log format compatibility. */
-
-    if (!s_visible || !s_canvas || !s_render_buf) {
-        s_last_us = esp_timer_get_time();
-        return;
-    }
-
-    int64_t now = esp_timer_get_time();
-    int64_t lvgl_slot_us = s_last_tick_exit_us ? (now - s_last_tick_exit_us)
-                                                : ((int64_t)TIMER_MS * 1000);
-    s_accum_lvgl_slot_us += lvgl_slot_us;
-    int64_t tick_us = s_last_us ? now - s_last_us : (int64_t)TIMER_MS * 1000;
-    float dt = (float)tick_us / 1000000.0f;
-    if (dt < 0.0f || dt > 0.10f) dt = (float)TIMER_MS / 1000.0f;
-    s_last_us = now;
-    s_buf = s_render_buf;
-
-    int64_t t0 = esp_timer_get_time();
-    render_weather(dt);
-    int64_t t_render = esp_timer_get_time();
-    s_last_frame_us = t_render - t0;
-    adapt_budget(s_last_frame_us);
-
-    lv_obj_invalidate(s_canvas);
-
-    s_frames++;
-    s_accum_us += s_last_frame_us;
-    s_accum_tick_us += tick_us;
-    if (s_frames >= LOG_EVERY_FRAMES) {
-        uint32_t avg = (uint32_t)(s_accum_us / s_frames);
-        uint32_t tick_avg = (uint32_t)(s_accum_tick_us / s_frames);
-        uint32_t tick_hz = tick_avg ? (uint32_t)(1000000ULL / tick_avg) : 0;
-        uint32_t bg_avg     = (uint32_t)(s_prof_bg_us       / s_frames);
-        uint32_t tx_avg     = (uint32_t)(s_prof_text_us     / s_frames);
-        uint32_t cl_avg     = (uint32_t)(s_prof_clouds_us   / s_frames);
-        uint32_t pa_avg     = (uint32_t)(s_prof_particles_us/ s_frames);
-        uint32_t li_avg     = (uint32_t)(s_prof_lightning_us/ s_frames);
-        uint32_t gl_avg     = (uint32_t)(s_prof_glass_us     / s_frames);
-        uint32_t lvgl_avg   = (uint32_t)(s_accum_lvgl_slot_us / s_frames);
-        uint32_t vsync_avg  = 0;
-        uint32_t up_avg     = (uint32_t)(prof_upscale_us    / s_frames);
-        ESP_LOGI(TAG, "%s tick=%u Hz, %u/%u particles c3d=%u/%u work_us=%u (bg=%u tx=%u cl=%u pa=%u li=%u gl=%u up=%u lvgl=%u vsync=%u)",
-                 weather_kind_name(s_kind), (unsigned)tick_hz,
-                 (unsigned)s_target, (unsigned)s_max_target,
-                 (unsigned)s_clouds3d_active, (unsigned)CLOUD_3D_MAX,
-                 (unsigned)avg,
-                 bg_avg, tx_avg, cl_avg, pa_avg, li_avg, gl_avg, up_avg, lvgl_avg, vsync_avg);
-        s_last_tick_hz = tick_hz;
-        s_last_work_us = avg;
-        s_last_bg_us = bg_avg;
-        s_last_cloud_us = cl_avg;
-        s_last_particle_us = pa_avg;
-        s_last_lightning_us = li_avg;
-        s_last_lvgl_us = lvgl_avg;
-        s_last_vsync_us = vsync_avg;
-        s_frames = 0;
-        s_accum_us = 0;
-        s_accum_tick_us = 0;
-        s_accum_lvgl_slot_us = 0;
-        s_prof_bg_us = 0;
-        s_prof_text_us = 0;
-        s_prof_clouds_us = 0;
-        s_prof_particles_us = 0;
-        s_prof_lightning_us = 0;
-        s_prof_glass_us = 0;
-        prof_upscale_us = 0;
-    }
-
-    s_last_tick_exit_us = esp_timer_get_time();
-}
-
-lv_obj_t *eva_weather_canvas_init(lv_obj_t *parent)
-{
-    if (s_canvas) return s_canvas;
-
-    s_rng ^= (uint32_t)esp_timer_get_time();
-    s_render_buf = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
-                                           EVA_WEATHER_CANVAS_W * EVA_WEATHER_CANVAS_H * sizeof(uint16_t),
-                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_render_buf) {
-        ESP_LOGE(TAG, "render buffer alloc failed");
-        abort();
-    }
-    s_display_buf = s_render_buf;
-    s_buf = s_render_buf;
-    if (!s_render_lock) {
-        s_render_lock = xSemaphoreCreateMutex();
-        if (!s_render_lock) {
-            ESP_LOGE(TAG, "render lock alloc failed");
-            abort();
-        }
-    }
-    s_bg_buf = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
-                                       EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
-                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_bg_buf) {
-        ESP_LOGE(TAG, "background buffer alloc failed");
-        abort();
-    }
-    /* Back buffer for the amortized sky repaint; if it fails we just fall
-     * back to the old synchronous rebake (s_bg_next stays NULL). */
-    s_bg_next = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
-                                        EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_bg_next) {
-        ESP_LOGW(TAG, "bg back buffer alloc failed — synchronous sky rebake");
-    }
-    s_scene_base = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
-                                             EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
-                                             MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_scene_base) {
-        ESP_LOGW(TAG, "scene-base buffer alloc failed — per-frame text fallback");
-    }
-    /* Scene text A8 cache (clock + date + temp + desc). Lifetime = process. */
-    s_scene_slot.a8 = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, TEXT_SLOT_BUF_BYTES,
-                                              MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!s_scene_slot.a8) {
-        ESP_LOGE(TAG, "text slot alloc failed");
-        abort();
-    }
-    ppa_client_config_t ppa_cfg = {
-        .oper_type = PPA_OPERATION_SRM,
-        .max_pending_trans_num = 1,
-    };
-    esp_err_t ppa_err = ppa_register_client(&ppa_cfg, &s_ppa_srm);
-    if (ppa_err != ESP_OK) {
-        ESP_LOGW(TAG, "PPA SRM unavailable (err=%d); CPU upscale fallback", (int)ppa_err);
-        s_ppa_srm = NULL;
-        s_ppa_disabled = true;
-    }
-    ppa_client_config_t ppa_blend_cfg = {
-        .oper_type = PPA_OPERATION_BLEND,
-        /* Enough slots for all cloud passes (3 layers × up to 2 bands × up
-         * to 2 variants during morph crossfade = 12) plus headroom. */
-        .max_pending_trans_num = 16,
-    };
-    esp_err_t ppa_blend_err = ppa_register_client(&ppa_blend_cfg, &s_ppa_blend);
-    if (ppa_blend_err != ESP_OK) {
-        ESP_LOGW(TAG, "PPA blend unavailable (err=%d); CPU cloud fallback", (int)ppa_blend_err);
-        s_ppa_blend = NULL;
-        s_ppa_blend_disabled = true;
-    }
-    /* Initialise the static glyph draw buffer so draw_text_utf8 can call
-     * lv_font_get_glyph_bitmap, which would dereference NULL inside
-     * lv_font_get_bitmap_fmt_txt (it does bitmap_out = draw_buf->data with
-     * no NULL check). */
-    lv_result_t db_init_res = lv_draw_buf_init(&s_glyph_draw_buf,
-                                               GLYPH_BUF_W, GLYPH_BUF_H,
-                                               LV_COLOR_FORMAT_A8,
-                                               GLYPH_BUF_W,
-                                               s_glyph_raw, GLYPH_BUF_BYTES);
-    if (db_init_res != LV_RESULT_OK) {
-        ESP_LOGE(TAG, "glyph draw_buf init failed res=%d (w=%d h=%d size=%d)",
-                 (int)db_init_res, GLYPH_BUF_W, GLYPH_BUF_H, GLYPH_BUF_BYTES);
-        abort();
-    }
-    ESP_LOGI(TAG, "glyph draw_buf ready: %dx%d A8, data=%p size=%d",
-             GLYPH_BUF_W, GLYPH_BUF_H, (void*)s_glyph_draw_buf.data, GLYPH_BUF_BYTES);
-
-    init_cloud_strips();
-
-    s_canvas = lv_canvas_create(parent);
-    lv_canvas_set_buffer(s_canvas, s_display_buf, EVA_WEATHER_CANVAS_W, EVA_WEATHER_CANVAS_H,
-                         LV_COLOR_FORMAT_RGB565);
-    lv_obj_set_size(s_canvas, EVA_WEATHER_CANVAS_W, EVA_WEATHER_CANVAS_H);
-    lv_obj_align(s_canvas, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_remove_flag(s_canvas, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_canvas, LV_OBJ_FLAG_HIDDEN);
-
-    reset_particles_for_kind();
-    s_timer = lv_timer_create(canvas_tick, TIMER_MS, NULL);
-    if (!s_timer) {
-        ESP_LOGE(TAG, "canvas timer create failed");
-        abort();
-    }
-    lv_timer_pause(s_timer);
-    ESP_LOGI(TAG, "allocated %u KB render + %u KB background buffers; %s upscale, %s cloud blend %dx%d -> %dx%d",
-             (unsigned)(EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t) / 1024),
-             (unsigned)(EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t) / 1024),
-             s_ppa_srm && !s_ppa_disabled ? "PPA" : "CPU",
-             s_ppa_blend && !s_ppa_blend_disabled ? "PPA" : "CPU",
-             EVA_WEATHER_RENDER_W, EVA_WEATHER_RENDER_H,
-             EVA_WEATHER_CANVAS_W, EVA_WEATHER_CANVAS_H);
-    return s_canvas;
 }
 
 void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel)
@@ -5967,6 +5802,8 @@ void eva_weather_canvas_set_kind(weather_kind_t kind)
 void eva_weather_canvas_set_weather(const weather_state_t *st)
 {
     if (!st) return;
+    if (s_render_lock) xSemaphoreTake(s_render_lock, portMAX_DELAY);
+
     /* Snapshot current LIVE render values before we overwrite them — these
      * become the transition's start point (or, if a transition is already
      * running, they already hold the interpolated mid-values, so restarting
@@ -6090,7 +5927,7 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
             s_bg_ttl = 0;
             s_bg_dt = 0.0f;
         }
-        return;
+        goto out;
     }
 
     /* Begin (or restart) a transition. start_* = the OLD live values we
@@ -6137,6 +5974,9 @@ void eva_weather_canvas_set_weather(const weather_state_t *st)
         if (desired > CLOUD_3D_MAX) desired = CLOUD_3D_MAX;
         s_clouds3d_active = (uint8_t)desired;
     }
+
+out:
+    if (s_render_lock) xSemaphoreGive(s_render_lock);
 }
 
 void eva_weather_canvas_show(bool show)

@@ -23,3 +23,11 @@ tools/cloudgen/.venv/
 tools/cloudgen/__pycache__/
 tools/cloudgen/*.png
 *.ppm
+
+# Python bytecode from tools/
+__pycache__/
+*.pyc
+
+# Local build config — menuconfig writes Wi-Fi credentials here.
+# Defaults live in sdkconfig.defaults; this file must stay untracked.
+sdkconfig

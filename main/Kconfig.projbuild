@@ -14,14 +14,18 @@ menu "Eva Weather"
 
     config EVA_WEATHER_LATITUDE
         string "Weather latitude"
-        default "50.447914"
+        default "48.915155"
         help
-            Latitude for Open-Meteo and Clear Outside requests.
+            Latitude for Open-Meteo and Clear Outside requests, decimal
+            degrees, north positive. Also drives the solar-elevation model
+            that picks the sky palette, so keep it close to where the panel
+            actually hangs.
 
     config EVA_WEATHER_LONGITUDE
         string "Weather longitude"
-        default "30.522192"
+        default "24.710636"
         help
-            Longitude for Open-Meteo and Clear Outside requests.
+            Longitude for Open-Meteo and Clear Outside requests, decimal
+            degrees, east positive.
 
 endmenu

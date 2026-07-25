@@ -1,14 +1,17 @@
 /* main/weather_fetch_openmeteo.c
  *
  * Fetches current weather from api.open-meteo.com and parses the JSON
- * into weather_partial_t. Coordinates: 48.915155 N, 24.710636 E
- * (hardcoded, same as clearoutside scraper).
+ * into weather_partial_t. Coordinates come from menuconfig
+ * (CONFIG_EVA_WEATHER_LATITUDE / _LONGITUDE), shared with the clearoutside
+ * scraper so both providers describe the same place.
  */
 #include "weather_fetch_openmeteo.h"
 
 #include <string.h>
 #include <stdlib.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "cJSON.h"
@@ -22,7 +25,8 @@ static const char *TAG = "wx_openmeteo";
  * `sunshine_duration` is in seconds per current day. */
 #define OPENMETEO_URL \
     "https://api.open-meteo.com/v1/forecast" \
-    "?latitude=48.915155&longitude=24.710636" \
+    "?latitude=" CONFIG_EVA_WEATHER_LATITUDE \
+    "&longitude=" CONFIG_EVA_WEATHER_LONGITUDE \
     "&current=temperature_2m,apparent_temperature," \
               "precipitation,weather_code,cloud_cover," \
               "cloud_cover_low,cloud_cover_mid,cloud_cover_high," \
@@ -248,7 +252,11 @@ esp_err_t weather_provider_openmeteo_fetch(weather_partial_t *out)
     out->moonrise_min = -1;
     out->moonset_min = -1;
 
-    fetch_buf_t fb = { .buf = malloc(OPENMETEO_BUF_SIZE), .len = 0, .cap = OPENMETEO_BUF_SIZE };
+    fetch_buf_t fb = {
+        .buf = heap_caps_malloc(OPENMETEO_BUF_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .len = 0,
+        .cap = OPENMETEO_BUF_SIZE,
+    };
     if (!fb.buf) return ESP_ERR_NO_MEM;
     fb.buf[0] = '\0';
 
@@ -262,7 +270,7 @@ esp_err_t weather_provider_openmeteo_fetch(weather_partial_t *out)
         .buffer_size_tx = 2048,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) { free(fb.buf); return ESP_FAIL; }
+    if (!client) { heap_caps_free(fb.buf); return ESP_FAIL; }
 
     esp_err_t err = esp_http_client_perform(client);
     int status = err == ESP_OK ? esp_http_client_get_status_code(client) : -1;
@@ -270,12 +278,12 @@ esp_err_t weather_provider_openmeteo_fetch(weather_partial_t *out)
 
     if (err != ESP_OK || status != 200) {
         ESP_LOGW(TAG, "fetch failed err=%d http=%d", err, status);
-        free(fb.buf);
+        heap_caps_free(fb.buf);
         return (err == ESP_OK) ? ESP_FAIL : err;
     }
     ESP_LOGI(TAG, "downloaded %u bytes", (unsigned)fb.len);
 
     err = parse_openmeteo_json(fb.buf, out);
-    free(fb.buf);
+    heap_caps_free(fb.buf);
     return err;
 }

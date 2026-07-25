@@ -1,4 +1,5 @@
 #include "eva_wifi.h"
+#include "eva_http_date.h"
 
 #include <string.h>
 #include <time.h>
@@ -14,6 +15,9 @@
 #include "esp_wifi.h"
 #include "sdkconfig.h"
 
+/* Credentials come from menuconfig (Eva Weather -> Wi-Fi SSID / password),
+ * declared in main/Kconfig.projbuild. Never hardcode them here — this repo
+ * is public. See README "Configure Wi-Fi and location". */
 #define WIFI_SSID       CONFIG_EVA_WIFI_SSID
 #define WIFI_PASSWORD   CONFIG_EVA_WIFI_PASSWORD
 #define WIFI_START_DELAY_MS  10000
@@ -142,23 +146,11 @@ static const char * const TIME_URLS[] = {
 };
 #define TIME_URLS_COUNT (sizeof(TIME_URLS) / sizeof(TIME_URLS[0]))
 
-/* Parse RFC 1123 date like "Thu, 21 May 2026 14:30:25 GMT" via strptime. */
+/* Parse RFC 1123 date like "Thu, 21 May 2026 14:30:25 GMT" via strptime +
+ * TZ-free UTC conversion (see eva_http_date.h). */
 static bool parse_http_date(const char *hdr, time_t *out)
 {
-    struct tm tm = {0};
-    char *end = strptime(hdr, "%a, %d %b %Y %H:%M:%S", &tm);
-    if (!end) return false;
-    /* timegm equivalent: setenv TZ=UTC, mktime, restore */
-    char *prev_tz = getenv("TZ");
-    char saved[64] = {0};
-    if (prev_tz) snprintf(saved, sizeof(saved), "%s", prev_tz);
-    setenv("TZ", "UTC0", 1); tzset();
-    time_t t = mktime(&tm);
-    if (saved[0]) setenv("TZ", saved, 1); else unsetenv("TZ");
-    tzset();
-    if (t == (time_t)-1) return false;
-    *out = t;
-    return true;
+    return eva_parse_http_date(hdr, out);
 }
 
 /* Capture Date: header via the event handler — esp_http_client_get_header()

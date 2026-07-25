@@ -82,7 +82,7 @@ bool eva_cloud_assets_init(void)
         return false;
     }
     if (!eva_clp_parse(s_pack, part->size, &s_toc)) {
-        ESP_LOGW(TAG, "no CLP2 pack in storage — procedural fallback");
+        ESP_LOGW(TAG, "no CLP2/CLP3 pack in storage — procedural fallback");
         return false;
     }
     memset(s_index, -1, sizeof s_index);

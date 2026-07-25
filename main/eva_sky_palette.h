@@ -12,7 +12,19 @@
 extern "C" {
 #endif
 
+/* Observer latitude for the solar-elevation model, decimal degrees north.
+ *
+ * This is a compile-time float because it is read inside the render path;
+ * CONFIG_EVA_WEATHER_LATITUDE is a *string* (menuconfig has no float type),
+ * so it cannot be used directly here without a runtime strtof() per frame.
+ * If you move the panel far in latitude, set this to match the value you
+ * put in menuconfig — a few degrees of error only shifts twilight timing
+ * slightly, so the two are allowed to drift a little.
+ *
+ * Overridable so host tools (tools/skypreview.c) can sweep latitudes. */
+#ifndef EVA_OBSERVER_LAT_DEG
 #define EVA_OBSERVER_LAT_DEG   48.915155f
+#endif
 #define EVA_SCENE_EVENING_MIN  105
 
 typedef struct {
