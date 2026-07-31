@@ -201,3 +201,14 @@ CONFIG_BSP_LCD_DPI_BUFFER_NUMS=2
 # NOTE: DYNAMIC_BUFFER is mutually exclusive with SSL_VARIABLE_BUFFER_LENGTH
 # (Kconfig: depends on !MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH) — enable only this one.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+
+# --- OTA (2026-08-01) ---
+# Rollback: the bootloader marks a freshly-booted OTA image PENDING_VERIFY. If
+# the app does not call esp_ota_mark_app_valid_cancel_rollback() the bootloader
+# reverts to the previous slot on the next reset. This is what guarantees a bad
+# build can never brick the panel beyond a power cycle — the self-check in
+# main.c gates on Wi-Fi coming back, because without Wi-Fi there is no way to
+# push a fix without the cable.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Deliberately NOT enabling CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK: it forbids
+# downgrades, and this project iterates and needs to flash older builds.

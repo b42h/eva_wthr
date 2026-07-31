@@ -14,3 +14,6 @@ dependencies:
     version: "==2.8.0"
   espressif/esp_wifi_remote:
     version: "==1.1.2"
+  # OTA discovery: lets tools/ota.py reach the panel as eva-weather.local
+  # instead of chasing a DHCP address.
+  espressif/mdns: "^1.8.0"

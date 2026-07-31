@@ -216,8 +216,25 @@ static void merge_and_apply(const weather_partial_t *om, bool have_om,
     st.clearoutside_ts = co_epoch_ts;
     st.fetched_at      = (time_t)now_epoch_sec();
 
-    /* Ukrainian description from kind */
-    snprintf(st.desc, sizeof(st.desc), "%s", weather_kind_label_uk(st.kind));
+    /* Cloud kinds must follow the CLOUD DATA, not open-meteo's WMO code.
+     * The WMO code is a coarse hourly summary and regularly disagrees with the
+     * cloud percentages we actually render — the panel showed "Мінлива
+     * хмарність" over a visibly clear sky because the code said code=2 while
+     * cloud_total_pct was 0. Precip/fog kinds still come from the providers
+     * (they are events, not a coverage threshold); only the dry-sky
+     * clear/partly/cloudy split is re-derived so the words match the scene.
+     * eva_weather_set() re-derives anyway when kind is UNKNOWN, so clearing it
+     * here routes the decision through the single shared threshold table. */
+    if (st.precip_type == PRECIP_NONE && st.fog_pct < 60 &&
+        (st.kind == WEATHER_CLEAR_DAY || st.kind == WEATHER_CLEAR_NIGHT ||
+         st.kind == WEATHER_PARTLY_CLOUDY_DAY ||
+         st.kind == WEATHER_PARTLY_CLOUDY_NIGHT ||
+         st.kind == WEATHER_CLOUDY)) {
+        st.kind = WEATHER_UNKNOWN;
+        st.desc[0] = '\0';
+    } else {
+        snprintf(st.desc, sizeof(st.desc), "%s", weather_kind_label_uk(st.kind));
+    }
 
     if (weather_fetch_is_pinned()) {
         /* Demo/test pin (CDC `weatherpin on`): keep fetching in the

@@ -45,6 +45,12 @@ void eva_weather_canvas_trigger_lightning(void);
  * Returns the new state. CDC `cloudvolume` test command. */
 bool eva_weather_canvas_toggle_volume(void);
 
+/* Quiesce every reader of the mmap'd cloud pack so the storage partition can be
+ * rewritten by a pack OTA. Clears the pack flag FIRST, then waits for any
+ * in-flight bake to finish — the reverse order would let a bake start in the
+ * gap. Clouds render procedurally afterwards; a reboot restores the pack. */
+void eva_weather_canvas_suspend_cloud_assets(void);
+
 /* Copy a coherent frame into `dst` under the render lock — unlike reading
  * display_buf() directly, this can never observe a half-painted frame.
  * `dst_bytes` must be ≥ 800*480*2. Returns false if the canvas isn't up. */

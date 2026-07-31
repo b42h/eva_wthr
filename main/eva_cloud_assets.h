@@ -27,6 +27,18 @@ typedef enum {
  * least one variant in either pool. */
 bool eva_cloud_assets_init(void);
 
+/* Stop serving anything backed by the mmap'd pack, so the storage partition can
+ * be rewritten underneath us during a pack OTA. After this returns,
+ * eva_cloud_assets_count() reports 0 and eva_cloud_assets_load() refuses, which
+ * makes the canvas fall back to procedural clouds — an already-supported state.
+ *
+ * Sprites (moon/bolt/fog/rain) were decompressed into PSRAM at init and do NOT
+ * alias the mapping, so they keep working.
+ *
+ * There is no resume: the mapping is only re-established by a reboot, which the
+ * pack OTA does anyway. */
+void eva_cloud_assets_suspend(void);
+
 /* Number of variants discovered for `layer` in `pool` (0 if none / init failed). */
 int eva_cloud_assets_count(int layer, cloud_pool_t pool);
 
@@ -38,7 +50,7 @@ int eva_cloud_assets_count(int layer, cloud_pool_t pool);
 bool eva_cloud_assets_load(int layer, cloud_pool_t pool, int idx,
                            uint8_t *a8_light, uint8_t *a8_shadow,
                            uint8_t *a8_core,
-                           int dst_w, int dst_h,
+                           int dst_w, int dst_h, int dst_stride,
                            bool mirror_x, float scale);
 
 /* Duration of the last successful load, in microseconds (for cloudinfo). */

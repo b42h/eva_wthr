@@ -8,6 +8,7 @@ import numpy as np
 import cloudgen, clm
 import skygen
 import sprites as spr
+import fog as fogmod
 import test_cloudgen
 
 NORMAL_VARIANTS = 4
@@ -25,6 +26,7 @@ CLP_TYPE_DROP  = 4
 CLP_TYPE_TRAIL = 5
 CLP_TYPE_RAIN  = 6
 CLP_TYPE_FOG   = 7
+CLP_TYPE_FLASH = 9
 CLP_TYPE_SKY   = 8
 
 CLOUD_POOL_NORMAL       = 0
@@ -146,6 +148,10 @@ def main():
                                         f"bolt_d{d}_v{v}.clm")
     for ph in range(4):
         total_sprites += add_sprite(CLP_TYPE_RAY, ph, 0, (spr.gen_rays(ph),), f"ray_p{ph}.clm")
+    # One pre-baked fog band; the device just scrolls it in X and blends once.
+    total_sprites += add_sprite(CLP_TYPE_FOG, 0, 0, (fogmod.gen_fog_band(),), "fog_band.clm")
+    # Radial lightning-flash falloff: one PPA blend instead of two CPU circles.
+    total_sprites += add_sprite(CLP_TYPE_FLASH, 0, 0, (spr.gen_flash(),), "flash.clm")
     for ph in range(spr.MOON_PHASE_COUNT):
         a, lum = spr.gen_moon(ph)
         total_sprites += add_sprite(CLP_TYPE_MOON, ph, 0, (a, lum), f"moon_p{ph}.clm")

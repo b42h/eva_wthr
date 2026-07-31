@@ -213,3 +213,35 @@ def gen_trail(variant, w=16, h=160):
     body = np.clip(1.0 - (np.abs(xx) / np.clip(width, 0.2, 1.0)), 0, 1)
     fade = yy ** 0.7                            # strongest near the drop
     return _a8(body * fade * 0.45)
+
+
+# --- lightning flash -------------------------------------------------------
+
+FLASH_R = 144          # keep in sync with EVA_FLASH_SPRITE_R in the canvas
+
+def gen_flash(r=FLASH_R):
+    """Radial falloff for the regional cloud illumination of a strike.
+
+    The device used to draw this as TWO CPU-blended filled circles (r=144 cool
+    + r=89 warm), ~90k pixels of read-modify-write that cost ~8.8 ms in the
+    single frame a strike lands on. Baking their SUM into one A8 mask turns it
+    into a single PPA blend. The two radii/alphas are reproduced exactly, so
+    the look is unchanged; only the falloff is precomputed."""
+    size = 2 * r
+    yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
+    c = r
+    d2 = (xx - c) ** 2 + (yy - c) ** 2
+
+    def disc(rad, peak):
+        # Smooth radial falloff. The C original tapered linearly in d^2 only
+        # over the outer quarter, which leaves a hard rim once the whole disc
+        # is baked into one mask and blended in a single pass (it showed as a
+        # circular edge on the storm deck). Smoothstep on normalised RADIUS
+        # keeps the bright centre but fades the edge to zero.
+        d = np.sqrt(d2) / float(rad)
+        t = np.clip(1.0 - d, 0.0, 1.0)
+        return (t * t * (3.0 - 2.0 * t)) * peak
+
+    # peaks match the runtime alphas: FIB_34/255 (cool) and FIB_55/255 (warm)
+    f = disc(r, 34 / 255.0) + disc(int(r * 89 / 144), 55 / 255.0)
+    return _a8(np.clip(f, 0.0, 1.0))

@@ -365,9 +365,15 @@ static const char *uk_for_precip(precip_type_t p)
 
 static const char *uk_for_clouds(uint8_t total_pct, bool is_night)
 {
-    if (total_pct >= 75) return "Хмарно";
-    if (total_pct >= 55) return "Мінлива хмарність";
-    return is_night ? "Ясна ніч" : "Ясно";
+    /* Thresholds follow the okta scale meteorologists actually use, so the
+     * words match what the sky is drawing. The old table jumped straight from
+     * "Ясно" to "Мінлива хмарність" at 55 %, which labelled a visibly
+     * half-clouded sky as clear. */
+    if (total_pct >= 88) return "Похмуро";              /* 8/8 overcast */
+    if (total_pct >= 70) return "Хмарно";               /* 6-7/8 */
+    if (total_pct >= 40) return "Мінлива хмарність";    /* 3-5/8 */
+    if (total_pct >= 15) return is_night ? "Малохмарна ніч" : "Малохмарно"; /* 1-2/8 */
+    return is_night ? "Ясна ніч" : "Ясно";              /* 0/8 */
 }
 
 /* --- top-level scrape ---------------------------------------------------- */

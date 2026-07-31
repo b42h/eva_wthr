@@ -13,7 +13,7 @@ static const char *TAG = "eva_weather";
 
 static weather_state_t s_weather = {
     .kind = WEATHER_UNKNOWN,
-    .desc = "Невідомо",
+    .desc = "Немає даних",
     .temp_c = 0,
     .feels_like_c = 0,
     .wind_kph = -1,
@@ -75,11 +75,11 @@ const char *weather_kind_label_uk(weather_kind_t kind)
     case WEATHER_FOG:                 return "Туман";
     case WEATHER_RAIN:                return "Дощ";
     case WEATHER_HEAVY_RAIN:          return "Злива";
-    case WEATHER_SNOW:                return "Сніг";
+    case WEATHER_SNOW:                return "Снігопад";
     case WEATHER_THUNDERSTORM:        return "Гроза";
     case WEATHER_SLEET:               return "Мокрий сніг";
     case WEATHER_HAIL:                return "Град";
-    default:                          return "Невідомо";
+    default:                          return "Немає даних";
     }
 }
 
@@ -178,8 +178,12 @@ weather_kind_t derive_kind_from_raw(const weather_state_t *st, bool is_night)
     /* clearoutside Total Clouds is the most authoritative single number for
      * scene selection — it's how a human would describe the sky overall. */
     uint8_t total = st->cloud_total_pct;
-    if (total >= 75) return WEATHER_CLOUDY;
-    if (total >= 55) return is_night ? WEATHER_PARTLY_CLOUDY_NIGHT
+    /* Keep these thresholds in step with uk_for_clouds() in
+     * weather_fetch_clearoutside.c — they are the same okta boundaries. If
+     * they drift apart the panel shows a label that contradicts the sky it is
+     * drawing (e.g. "Мінлива хмарність" over a clear scene). */
+    if (total >= 70) return WEATHER_CLOUDY;
+    if (total >= 40) return is_night ? WEATHER_PARTLY_CLOUDY_NIGHT
                                      : WEATHER_PARTLY_CLOUDY_DAY;
     return is_night ? WEATHER_CLEAR_NIGHT : WEATHER_CLEAR_DAY;
 }
@@ -238,13 +242,17 @@ static void restore_state(void)
     free(raw);
     s_weather = restored;
 
-    /* weatherdebug/weatherraw snapshots must not survive reboot — they were
-     * written before we split transient vs persisted sets, or by older builds. */
+    /* Legacy cleanup only: builds before the transient/persisted split wrote
+     * weatherdebug snapshots to NVS and tagged their desc with " наживо".
+     * Current builds use eva_weather_set_transient() (persist=false), so this
+     * can no longer happen — and the marker itself was removed from the desc
+     * because it was user-visible on the panel. Keep this check so a device
+     * flashed from an older build still discards the stale snapshot. */
     if (strstr(s_weather.desc, "наживо") != NULL) {
         ESP_LOGW(TAG, "discarding debug weather snapshot from NVS");
         s_weather = (weather_state_t){
             .kind = WEATHER_UNKNOWN,
-            .desc = "Невідомо",
+            .desc = "Немає даних",
             .sunrise_min = -1,
             .sunset_min = -1,
         };

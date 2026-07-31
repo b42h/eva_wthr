@@ -1,5 +1,6 @@
 #include "eva_weather_canvas.h"
 #include "eva_cloud_assets.h"
+#include "eva_ota_state.h"
 #include "eva_clp_toc.h"
 #include "eva_wx_transition.h"
 #include "eva_dither.h"
@@ -89,6 +90,18 @@ static inline void eva_land_rect_to_port(int lx, int ly, int lw, int lh,
 #else
 #define CLOUD_STRIP_W 800
 #endif
+/* Physical row stride of a cloud mask == the scroll period.
+ *
+ * MEASURED DEAD END (2026-07-28): widening this by one screen-width and
+ * duplicating the row start into the margin does make every scrolled window
+ * contiguous, halving the PPA band count (6.5 -> 3.3 per frame). It bought
+ * **under 1 Hz** and cost 3.5 MB of PSRAM, so it was reverted. The reason:
+ * a layer's two bands SPLIT the same 800 px width between them, so band
+ * count never changed how many pixels were blended. Cloud blend is
+ * per-pixel (~23 ns/px), not per-transaction — to make it faster you must
+ * blend FEWER PIXELS, not issue fewer transactions. */
+#define CLOUD_STRIP_STRIDE CLOUD_STRIP_W
+
 #define CLOUD_LAYER_HIGH 0
 #define CLOUD_LAYER_MID  1
 #define CLOUD_LAYER_LOW  2
@@ -151,6 +164,8 @@ static bool s_glass_drops_inited;
 static uint8_t *s_wet_glass;            /* 800×480 A8 wet-pane accumulation */
 static int s_wet_y0 = 1 << 30, s_wet_y1 = -1;
 static uint8_t s_wet_decay_tick;
+static int s_wet_decay_row = -1;   /* sliced decay cursor */
+static int s_wet_scan_y0 = 1 << 30, s_wet_scan_y1 = -1;
 
 typedef enum {
     P_NONE = 0,
@@ -275,23 +290,61 @@ static uint16_t *s_bg_next;
  * (rain must stay above digits — see scene_text_can_cache). */
 static uint16_t *s_scene_base;
 static bool s_scene_base_dirty = true;
+/* Incremental scene-base refresh state. `sky_dirty` means the cached base's
+ * SKY is stale (a rebake landed) and the whole base must be rebuilt;
+ * otherwise only the text rows need restoring. `text_y0/y1` remember which
+ * rows the previous text occupied so the old glyphs get erased. */
+static bool s_scene_base_sky_dirty = true;
+static bool s_scene_base_valid;
+static int s_scene_base_text_y0, s_scene_base_text_y1;
+static uint32_t s_prof_sbrebuild_us, s_prof_framecopy_us;
 static bool s_scene_text_done_this_frame;
 static bool s_merged_storm_active;
 static bool s_storm_lit_active;
 static float s_rain_loop_t;
 static int s_fog_drift_x;
+/* Fog is one pre-baked band sprite (tools/cloudgen/fog.py). Probed once so
+ * the particle path can be skipped entirely when the pack provides it. */
+static bool s_fog_sprite_ok;
+static bool s_fog_sprite_probed;
+/* First row of the baked fog band; everything above is guaranteed zero by the
+ * generator, so only these rows are blended. Keep in sync with BAND_Y0 in
+ * tools/cloudgen/fog.py. */
+#define EVA_FOG_SPRITE_Y0 112
 static int s_bg_paint_row = -1;   /* -1 idle, else next row to paint */
 static sky_t s_bg_snap_sky;
 static float s_bg_snap_sun_x, s_bg_snap_sun_y, s_bg_snap_warmth;
 static float s_bg_snap_t;
-#define BG_PAINT_ROWS_PER_FRAME 64
+/* Rows of sky repainted per frame during an amortized rebake.
+ * MEASURED 2026-07-28: fill_sky_rows() costs ~470 ns/px (gradient + Bayer
+ * dither + sun warmth), so 64 rows = ~24 ms — well over a frame budget. Eight
+ * such frames in a row is a ~190 ms hitch, and with a rebake roughly every
+ * 1.4 s that is exactly the "freeze once a second" the display shows.
+ * 16 rows ≈ 6 ms/frame keeps every frame inside budget; the rebake simply
+ * takes 30 frames instead of 8, which is invisible because the sky it is
+ * painting has not changed yet. Do not raise this for "faster" rebakes —
+ * total work is identical, only the per-frame spike changes. */
+#define BG_PAINT_ROWS_PER_FRAME 16
 static bool s_blend_from_sky;
+/* When set, the first cloud blend of the frame reads its background from here
+ * instead of s_buf. Used to skip the 750 KB scene_base -> s_buf copy. */
+static const uint16_t *s_cloud_bg_src;
 static uint16_t *s_display_buf;
 static uint16_t *s_render_buf;
+/* Second landscape scene buffer for the PIPELINED rotation (2026-07-28).
+ * PPA already ran in NON_BLOCKING mode, but the loop waited on
+ * s_ppa_done_sem immediately, so the ~14.7 ms rotation was pure CPU stall
+ * every frame. With two scene buffers the CPU renders frame N+1 into the
+ * spare while PPA still reads frame N, and we only wait for the PREVIOUS
+ * rotation — hiding the rotation behind the render.
+ * NULL => allocation failed => fall back to the old synchronous behaviour. */
+static uint16_t *s_render_buf_alt;
+static bool s_ppa_inflight;
 static esp_lcd_panel_handle_t s_panel;
-static uint16_t *s_dpi_fb[2];
+static uint16_t *s_dpi_fb[3];
 static uint16_t *s_dpi_scan_fb;
 static uint16_t *s_dpi_back_fb;
+static uint16_t *s_dpi_free_fb;   /* neither scanned nor queued: PPA target */
 #ifdef EVA_PORTRAIT_NATIVE
 static void copy_landscape_rgb565_to_sbuf(const uint16_t *landscape_src)
 {
@@ -504,6 +557,11 @@ static portMUX_TYPE s_li_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint8_t s_bg_ttl;
 static float s_bg_dt;
+/* Sky-rebake gating: the repaint only matters when its INPUTS change
+ * (wall-clock minute, an easing weather transition, or an explicit request
+ * such as a kind change). See the comment at the gate in render_weather(). */
+static int s_bg_last_minute = -1;
+static bool s_bg_force_rebake = true;   /* first frame must paint */
 static bool s_visible;
 /* Sun event minutes-of-day from clearoutside astronomy. -1 = unknown -> fall back to
  * hardcoded 6:00 / 18:00 used in the original time-of-day spec. The window
@@ -541,6 +599,9 @@ static int64_t s_prof_particles_us;
 static int64_t s_prof_lightning_us;
 static int64_t s_prof_glass_us;
 static uint32_t s_prof_blend_bands;    /* PPA band blends this log window */
+static uint32_t s_prof_band_small_us, s_prof_band_small_n;
+static uint32_t s_prof_band_mid_us, s_prof_band_mid_n;
+static uint32_t s_prof_band_big_us, s_prof_band_big_n;
 static uint32_t s_prof_morph_frames;   /* frames with ≥1 layer morphing */
 /* Frames where the panel was still scanning after 40 ms, so the buffer swap
  * was skipped. Non-zero means the scene renders slower than the panel can
@@ -1253,18 +1314,31 @@ static void bake_scene_text_slot(scene_text_slot_t *slot,
     slot->key_daypart = (uint8_t)daypart;
     slot->valid = true;
 
-    /* Tight bbox for per-frame blit — full 800×480 scan only on text rebake. */
+    /* Tight bbox for per-frame blit — only on text rebake.
+     * Scans word-at-a-time and skips empty rows wholesale: the mask is mostly
+     * zero, and the old per-pixel loop with a branch on every one of the
+     * 384000 bytes was measured at ~26 ms of the ~35 ms text rebake. */
     slot->bbox_valid = false;
     int bx0 = canvas_w, by0 = canvas_h, bx1 = -1, by1 = -1;
     for (int row = 0; row < canvas_h; ++row) {
         const uint8_t *mrow = &slot->a8[row * canvas_w];
-        for (int col = 0; col < canvas_w; ++col) {
-            if (mrow[col] == 0) continue;
-            if (col < bx0) bx0 = col;
-            if (col > bx1) bx1 = col;
-            if (row < by0) by0 = row;
-            if (row > by1) by1 = row;
+        const uint32_t *w32 = (const uint32_t *)mrow;
+        int words = canvas_w / 4;
+        int first_w = -1, last_w = -1;
+        for (int i = 0; i < words; ++i) {
+            if (w32[i]) { if (first_w < 0) first_w = i; last_w = i; }
         }
+        if (first_w < 0) continue;                 /* empty row: skip entirely */
+        if (row < by0) by0 = row;
+        if (row > by1) by1 = row;
+        /* Narrow to exact columns only inside the two boundary words. */
+        int c0 = first_w * 4;
+        while (c0 < canvas_w && mrow[c0] == 0) ++c0;
+        int c1 = last_w * 4 + 3;
+        if (c1 >= canvas_w) c1 = canvas_w - 1;
+        while (c1 > c0 && mrow[c1] == 0) --c1;
+        if (c0 < bx0) bx0 = c0;
+        if (c1 > bx1) bx1 = c1;
     }
     if (bx1 >= bx0 && by1 >= by0) {
         slot->bbox_x0 = (uint16_t)bx0;
@@ -1382,7 +1456,10 @@ static void blit_text_slot(const scene_text_slot_t *slot, int dst_x, int dst_y,
     blit_text_mask_at(slot, dst_x, dst_y, x0, y0, x1, y1, color, base_alpha);
 }
 
-static void draw_scene_text_overlays(void)
+/* Re-bake the cached text mask only (no drawing), so callers can read the new
+ * bbox before deciding which rows to restore. Cheap when nothing changed —
+ * bake_scene_text_slot() early-outs on an unchanged key. */
+static void refresh_scene_text_slot(void)
 {
     char clock_txt[sizeof(s_clock_text)];
     char date_txt[sizeof(s_date_text)];
@@ -1398,8 +1475,12 @@ static void draw_scene_text_overlays(void)
     date_txt[sizeof(date_txt) - 1] = '\0';
     temp_txt[sizeof(temp_txt) - 1] = '\0';
     desc_txt[sizeof(desc_txt) - 1] = '\0';
-
     bake_scene_text_slot(&s_scene_slot, clock_txt, date_txt, temp_txt, desc_txt);
+}
+
+static void draw_scene_text_overlays(void)
+{
+    refresh_scene_text_slot();
     blit_text_slot(&s_scene_slot, 0, 0, rgb565(255, 255, 255), 240);
 }
 
@@ -2049,21 +2130,33 @@ static void bake_strip_fallback_low(uint8_t *a8_light, uint8_t *a8_shadow,
 
 static void bake_strip_fallback_for_layer(int layer, cloud_variant_t *v, int h)
 {
-    if (!v || !v->a8_light || !v->a8_shadow || !v->a8_core) return;
+    if (!v || !v->a8_light) return;
+    /* The procedural bakers write all three planes in one pass and are not
+     * worth restructuring for the light-only case; give them a throwaway
+     * buffer for the planes we do not keep. This path only runs when the
+     * asset pack is missing/corrupt, so the temporary allocation is rare. */
+    uint8_t *shadow = v->a8_shadow;
+    uint8_t *core = v->a8_core;
+    uint8_t *scratch = NULL;
+    if (!shadow || !core) {
+        scratch = heap_caps_malloc((size_t)CLOUD_STRIP_W * h,
+                                   MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!scratch) return;          /* leave the strip empty rather than crash */
+        if (!shadow) shadow = scratch;
+        if (!core) core = scratch;
+    }
     if (layer == CLOUD_LAYER_HIGH) {
-        bake_strip_fallback_high(v->a8_light, v->a8_shadow, v->a8_core,
-                        CLOUD_STRIP_W, h);
+        bake_strip_fallback_high(v->a8_light, shadow, core, CLOUD_STRIP_W, h);
     } else if (layer == CLOUD_LAYER_MID) {
-        bake_strip_fallback_mid(v->a8_light, v->a8_shadow, v->a8_core,
-                       CLOUD_STRIP_W, h);
+        bake_strip_fallback_mid(v->a8_light, shadow, core, CLOUD_STRIP_W, h);
     } else {
-        bake_strip_fallback_low(v->a8_light, v->a8_shadow, v->a8_core,
-                       CLOUD_STRIP_W, h);
+        bake_strip_fallback_low(v->a8_light, shadow, core, CLOUD_STRIP_W, h);
     }
     /* Softens only the far off-screen strip margins — not the viewport band. */
     feather_strip_edges(v->a8_light,  CLOUD_STRIP_W, h, FIB_8);
-    feather_strip_edges(v->a8_shadow, CLOUD_STRIP_W, h, FIB_8);
-    feather_strip_edges(v->a8_core,   CLOUD_STRIP_W, h, FIB_8);
+    if (v->a8_shadow) feather_strip_edges(v->a8_shadow, CLOUD_STRIP_W, h, FIB_8);
+    if (v->a8_core)   feather_strip_edges(v->a8_core,   CLOUD_STRIP_W, h, FIB_8);
+    if (scratch) heap_caps_free(scratch);
 }
 
 static void scan_variant_content_rows(cloud_variant_t *v, int strip_h)
@@ -2073,7 +2166,7 @@ static void scan_variant_content_rows(cloud_variant_t *v, int strip_h)
     {
         int y0 = -1, y1 = -1;
         for (int y = 0; y < strip_h; ++y) {
-            const uint8_t *row = &v->a8_light[y * CLOUD_STRIP_W];
+            const uint8_t *row = &v->a8_light[y * CLOUD_STRIP_STRIDE];
             bool nz = false;
             for (int x = 0; x < CLOUD_STRIP_W; x += 4) {  /* stride-4 probe */
                 if (row[x]) { nz = true; break; }
@@ -2161,7 +2254,7 @@ static void load_or_bake_variant(int layer, cloud_strip_t *strip,
         if (eva_cloud_assets_load(asset_layer, pool, idx,
                                   v->a8_light, v->a8_shadow, v->a8_core,
                                   CLOUD_STRIP_W, strip->strip_h,
-                                  mirror, scale)) {
+                                  CLOUD_STRIP_STRIDE, mirror, scale)) {
             strip->pool_kind = (uint8_t)pool;
             strip->pool_prev = strip->pool_cur;
             strip->pool_cur = (uint8_t)idx;
@@ -2237,6 +2330,11 @@ static void init_cloud_strips(void)
         s_cloud_assets_ok = eva_cloud_assets_init();
         if (!s_cloud_assets_ok) {
             ESP_LOGW(TAG, "no pre-baked cloud assets — using procedural bake");
+            /* The stored pack hash claims we have a pack we cannot parse —
+             * usually a pack OTA interrupted by power loss. Forgetting it makes
+             * the next tools/ota.py run re-send automatically, so this heals
+             * without anyone reaching for a cable. */
+            eva_ota_state_clear_pack_sha();
         }
     }
     /* Re-seed the canvas RNG once so the stable boot-seed doesn't lead to
@@ -2245,7 +2343,7 @@ static void init_cloud_strips(void)
     s_rng ^= (uint32_t)esp_timer_get_time();
     for (int i = 0; i < CLOUD_LAYER_COUNT; ++i) {
         cloud_strip_t *strip = &s_strip[i];
-        size_t bytes = (size_t)CLOUD_STRIP_W * strip->strip_h;
+        size_t bytes = (size_t)CLOUD_STRIP_STRIDE * strip->strip_h;
         for (int j = 0; j < CLOUD_VARIANT_COUNT; ++j) {
             cloud_variant_t *v = &strip->variant[j];
             if (v->a8_light) {
@@ -2260,18 +2358,31 @@ static void init_cloud_strips(void)
                 heap_caps_free(v->a8_core);
                 v->a8_core = NULL;
             }
+            /* Light-only by default: the device renders ONLY a8_light unless
+             * `cloudvolume` turns on 3-plane volume rendering, yet shadow+core
+             * were always allocated — 2/3 of a 10.8 MB pool sitting unused.
+             * That left ~151 KB of PSRAM free, too little for the procedural
+             * fog buffer AND the JPEG encoder. Allocating them only when
+             * volume rendering is actually on frees ~7 MB. The CDC toggle
+             * re-bakes the pool (see eva_weather_canvas_toggle_volume), so
+             * turning volume on still gets real shadow/core data.
+             * eva_cloud_assets_load() and blend_layer_variant() both treat a
+             * NULL plane as "not present". */
+            bool want_volume = s_cloud_volume;
             v->a8_light = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            v->a8_shadow = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
-                                                    MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            v->a8_core = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
-                                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (!v->a8_light || !v->a8_shadow || !v->a8_core) {
+            if (want_volume) {
+                v->a8_shadow = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
+                                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+                v->a8_core = heap_caps_aligned_alloc(PPA_CACHE_ALIGN, bytes,
+                                                      MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            }
+            if (!v->a8_light || (want_volume && (!v->a8_shadow || !v->a8_core))) {
                 ESP_LOGE(TAG, "cloud strip %d variant %d alloc failed", i, j);
                 abort();
             }
             load_or_bake_variant(i, strip, v);
-            total += 3 * bytes;
+            total += (want_volume ? 3 : 1) * bytes;
         }
         strip->active_variant = 0;
         strip->morphing = false;
@@ -2439,7 +2550,10 @@ static particle_kind_t particle_kind_for_slot(uint16_t slot)
     case WEATHER_HAIL:
         return P_HAIL;
     case WEATHER_FOG:
-        return P_FOG;
+        /* The pre-baked fog band replaces the particles when the pack has it
+         * (it is both cheaper and better looking — the discs read as
+         * bubbles). P_FOG survives only for packs without a fog sprite. */
+        return s_fog_sprite_ok ? P_NONE : P_FOG;
     case WEATHER_CLEAR_NIGHT:
     case WEATHER_PARTLY_CLOUDY_NIGHT:
         return P_STAR;
@@ -2500,6 +2614,17 @@ static void reset_particles_for_kind(void)
 
 static void ensure_particle_count(void)
 {
+    /* Resolve the fog sprite BEFORE assigning particle kinds so
+     * particle_kind_for_slot() can return P_NONE and skip spawning circles
+     * the sprite would just draw over. */
+    if (s_kind == WEATHER_FOG && !s_fog_sprite_probed) {
+        eva_sprite_t probe;
+        s_fog_sprite_probed = true;
+        s_fog_sprite_ok = eva_cloud_assets_sprite(EVA_CLP_TYPE_FOG, 0, 0, &probe) &&
+                          probe.plane[0] != NULL;
+        ESP_LOGI(TAG, "fog: %s", s_fog_sprite_ok ? "pre-baked band sprite"
+                                                 : "no sprite in pack -> CPU particles");
+    }
     for (uint16_t i = 0; i < PARTICLE_MAX; ++i) {
         if (i < s_target) {
             particle_kind_t pk = particle_kind_for_slot(i);
@@ -3540,11 +3665,12 @@ static void blend_mask_cpu(const cloud_strip_t *strip,
     s_prof_blend_bands++;
     uint16_t tint = rgb565(tr, tg, tb);
     for (int y = src_row0; y < src_row1; ++y) {
-        const uint8_t *src = &mask[y * CLOUD_STRIP_W + src_x];
+        const uint8_t *src = &mask[y * CLOUD_STRIP_STRIDE + src_x];
         int dst_y = eff_y + y;
         if ((unsigned)dst_y >= EVA_WEATHER_RENDER_H) continue;
-        const uint16_t *sky_row = (bg_from_sky && s_bg_buf)
-            ? &s_bg_buf[dst_y * EVA_WEATHER_RENDER_W + dst_x] : NULL;
+        const uint16_t *alt = s_cloud_bg_src ? s_cloud_bg_src : s_bg_buf;
+        const uint16_t *sky_row = (bg_from_sky && alt)
+            ? &alt[dst_y * EVA_WEATHER_RENDER_W + dst_x] : NULL;
         for (int x = 0; x < width; ++x) {
             uint8_t a = (uint8_t)(((uint16_t)src[x] * alpha_scale) / 255);
             if (a) {
@@ -3591,7 +3717,13 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
     }
     if (strip_h <= 0) return ESP_OK;   /* fully off-screen: skip silently */
 
-    const bool use_sky_bg = bg_from_sky && s_bg_buf;
+    /* Background source for the FIRST blend of a frame. Normally the clouds
+     * blend over s_buf in place; when s_cloud_bg_src is set the first layer
+     * reads from THAT buffer instead and writes s_buf, which folds the
+     * full-frame scene_base -> s_buf copy into work PPA already does. */
+    const uint16_t *alt_bg = bg_from_sky ? (s_cloud_bg_src ? s_cloud_bg_src : s_bg_buf)
+                                         : NULL;
+    const bool use_sky_bg = alt_bg != NULL;
 #ifdef EVA_PORTRAIT_NATIVE
     if (use_sky_bg) {
         return ESP_FAIL;   /* landscape sky cache → CPU path with idx transform */
@@ -3615,7 +3747,7 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
         },
         .in_fg = {
             .buffer = (void *)mask,
-            .pic_w = CLOUD_STRIP_W,
+            .pic_w = CLOUD_STRIP_STRIDE,
             .pic_h = (uint32_t)strip->strip_h,
             .block_w = (uint32_t)fg_bw,
             .block_h = (uint32_t)fg_bh,
@@ -3640,7 +3772,7 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
 #else
     ppa_blend_oper_config_t cfg = {
         .in_bg = {
-            .buffer = use_sky_bg ? (void *)s_bg_buf : (void *)s_buf,
+            .buffer = use_sky_bg ? (void *)alt_bg : (void *)s_buf,
             .pic_w = EVA_WEATHER_RENDER_W,
             .pic_h = EVA_WEATHER_RENDER_H,
             .block_w = (uint32_t)width,
@@ -3651,7 +3783,7 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
         },
         .in_fg = {
             .buffer = (void *)mask,
-            .pic_w = CLOUD_STRIP_W,
+            .pic_w = CLOUD_STRIP_STRIDE,
             .pic_h = (uint32_t)strip->strip_h,
             .block_w = (uint32_t)width,
             .block_h = (uint32_t)strip_h,
@@ -3674,7 +3806,15 @@ static esp_err_t blend_mask_ppa_one_band(const cloud_strip_t *strip,
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
 #endif
+    int64_t _b0 = esp_timer_get_time();
     esp_err_t err = ppa_do_blend(s_ppa_blend, &cfg);
+    {
+        uint32_t d = (uint32_t)(esp_timer_get_time() - _b0);
+        uint32_t rows = (uint32_t)(src_row1 - src_row0);
+        if (rows < 120)      { s_prof_band_small_us += d; s_prof_band_small_n++; }
+        else if (rows < 170) { s_prof_band_mid_us   += d; s_prof_band_mid_n++; }
+        else                 { s_prof_band_big_us   += d; s_prof_band_big_n++; }
+    }
     if (err == ESP_OK && bg_from_sky && s_blend_from_sky) {
         s_blend_from_sky = false;
     }
@@ -3695,7 +3835,11 @@ static void blend_layer_variant(cloud_strip_t *strip,
                                 uint8_t alpha_scale,
                                 bool sky_wrap)
 {
-    if (!v || !v->a8_light || !v->a8_shadow || !v->a8_core || alpha_scale == 0) return;
+    /* Only a8_light is required. shadow/core are absent in the default
+     * light-only configuration (they are allocated solely when
+     * `cloudvolume` is on); the volume block below is already gated on
+     * s_cloud_volume, and each plane is null-checked there. */
+    if (!v || !v->a8_light || alpha_scale == 0) return;
 
     int src_row0 = (int)v->content_y0;
     int src_row1 = (int)v->content_y1;
@@ -3752,8 +3896,11 @@ static void blend_layer_variant(cloud_strip_t *strip,
      * device — 3× the PPA bands per layer, measured on hardware. */
     esp_err_t err = ESP_OK;
 
-    /* --- shadow + core, only when volume rendering is on --------------- */
-    if (s_cloud_volume) {
+    /* --- shadow + core, only when volume rendering is on ---------------
+     * The plane pointers are also checked: `cloudvolume` can be toggled on
+     * at runtime before the pool has been re-baked with the extra planes,
+     * so "volume requested" does not yet imply "planes present". */
+    if (s_cloud_volume && v->a8_shadow && v->a8_core) {
         if (shadow_alpha) {
             err = blend_mask_ppa_one_band(strip, v->a8_shadow,
                                            strip->tint_shadow_r,
@@ -3872,9 +4019,19 @@ static void update_cloud_lifecycle(float dt)
                 if (j != i && s_strip[j].morphing) { another_morphing = true; break; }
             }
             if (another_morphing) {
-                /* Hold this layer's clock at the threshold — it starts as
-                 * soon as the current crossfade finishes. */
-                strip->morph_clock = strip->morph_hold_s;
+                /* Serialize: only one layer crossfades at a time (a morphing
+                 * layer costs ~6.5 ms/frame extra — measured 22.2 ms vs
+                 * 15.7 ms `cl`, 2026-07-28). Do NOT pin the clock at the
+                 * threshold here: that made every waiting layer fire the
+                 * instant the previous crossfade ended, so the three layers
+                 * formed a permanent relay and `mfr` sat at 21/21 frames —
+                 * the morph surcharge was paid on essentially EVERY frame,
+                 * and the resulting 15.7/22.2 ms swing is the bimodal frame
+                 * time behind the stutter. Just don't start now; the clock
+                 * keeps running (capped so a long crossfade elsewhere can't
+                 * bank unbounded credit and re-create the relay). */
+                float cap = strip->morph_hold_s * 0.75f;
+                if (strip->morph_clock > cap) strip->morph_clock = cap;
             } else if (strip->morph_clock >= strip->morph_hold_s) {
                 strip->morphing = true;
                 strip->morph_t = 0.0f;
@@ -3925,8 +4082,20 @@ static bool blend_layer(cloud_strip_t *strip, bool sky_wrap)
     float eased = t * t * (3.0f - 2.0f * t);
     uint8_t a0 = alpha_scaled_by_float(strip->alpha_scale, 1.0f - eased);
     uint8_t a1 = alpha_scaled_by_float(strip->alpha_scale, eased);
-    blend_layer_variant(strip, &strip->variant[active], a0, sky_wrap);
-    blend_layer_variant(strip, &strip->variant[next], a1, sky_wrap);
+    /* A crossfade costs TWO full-strip blends instead of one (+7.5 ms/frame,
+     * measured 2026-07-28) — enough to push the frame across a 16.67 ms
+     * vsync boundary, which is felt as a periodic hitch even though the
+     * average FPS is unchanged. The smoothstep ease spends a good part of
+     * its travel with one side essentially invisible, so drop a plane once
+     * its alpha falls below the same perceptual floor used above
+     * (FIB_8 ≈ 3 %). Both ends of the fade then cost one blend, and only
+     * the middle pays for two. Purely a cost optimization: the skipped
+     * plane contributes < 3 % alpha and is not visible. */
+    bool draw0 = a0 >= FIB_8, draw1 = a1 >= FIB_8;
+    if (!draw0 && !draw1) draw0 = true;      /* never emit an empty layer */
+    if (draw0) blend_layer_variant(strip, &strip->variant[active], a0, sky_wrap);
+    if (draw1) blend_layer_variant(strip, &strip->variant[next], a1,
+                                   draw0 ? false : sky_wrap);
     return true;
 }
 
@@ -4041,6 +4210,7 @@ static void compose_clouds_into_working_buffer(float dt)
     (void)blend_layer(&s_strip[CLOUD_LAYER_LOW], sky_wrap);
 }
 
+/* Full-screen A8-over-RGB565 blend with a fixed tint colour. */
 static bool blit_offline_a8_full(const uint8_t *mask, int mw, int mh,
                                  uint16_t tint, uint8_t alpha_scale,
                                  int scroll_x, int scroll_y)
@@ -4081,15 +4251,76 @@ static bool blit_offline_a8_full(const uint8_t *mask, int mw, int mh,
         },
         .fg_alpha_update_mode = PPA_ALPHA_SCALE,
         .fg_alpha_scale_ratio = (float)alpha_scale / 256.0f,
-        .fg_fix_rgb_val = { .b = tint & 0x1f, .g = (tint >> 5) & 0x3f, .r = (tint >> 11) & 0x1f },
+        /* overwritten below with properly expanded RGB888 */
         .mode = PPA_TRANS_MODE_BLOCKING,
     };
-    uint8_t tb = (uint8_t)(tint & 0x1f);
-    uint8_t tg = (uint8_t)((tint >> 5) & 0x3f);
-    uint8_t tr = (uint8_t)((tint >> 11) & 0x1f);
-    cfg.fg_fix_rgb_val.r = tr;
-    cfg.fg_fix_rgb_val.g = tg;
-    cfg.fg_fix_rgb_val.b = tb;
+    /* NOTE: passes the raw RGB565 fields, NOT expanded RGB888. That is
+     * technically wrong for this field, but every alpha in the fog/rain paths
+     * was tuned against this behaviour — "fixing" it to true RGB888 makes fog
+     * a white-out (verified on hardware 2026-07-28). Leave as-is unless the
+     * alphas are retuned together with it. */
+    cfg.fg_fix_rgb_val.r = (uint8_t)((tint >> 11) & 0x1f);
+    cfg.fg_fix_rgb_val.g = (uint8_t)((tint >> 5) & 0x3f);
+    cfg.fg_fix_rgb_val.b = (uint8_t)(tint & 0x1f);
+    return ppa_do_blend(s_ppa_blend, &cfg) == ESP_OK;
+}
+
+/* Same blend, but only for destination rows [y0, RENDER_H). Used by fog: the
+ * baked band is guaranteed empty above BAND_Y0, so blending the whole screen
+ * would spend ~23 % of the transfer on alpha-zero pixels. */
+static bool blit_offline_a8_band(const uint8_t *mask, int mw, int mh,
+                                 uint16_t tint, uint8_t alpha_scale,
+                                 int scroll_x, int y0)
+{
+    if (!mask || !s_ppa_blend || s_ppa_blend_disabled || alpha_scale == 0) {
+        return false;
+    }
+    if (y0 < 0) y0 = 0;
+    int rows = EVA_WEATHER_RENDER_H - y0;
+    if (rows <= 0 || y0 >= mh) return false;
+    if (rows > mh - y0) rows = mh - y0;
+    s_prof_blend_bands++;
+    ppa_blend_oper_config_t cfg = {
+        .in_bg = {
+            .buffer = s_buf,
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_w = EVA_WEATHER_RENDER_W,
+            .block_h = (uint32_t)rows,
+            .block_offset_x = 0,
+            .block_offset_y = (uint32_t)y0,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .in_fg = {
+            .buffer = (void *)mask,
+            .pic_w = (uint32_t)mw,
+            .pic_h = (uint32_t)mh,
+            .block_w = EVA_WEATHER_RENDER_W,
+            .block_h = (uint32_t)rows,
+            .block_offset_x = (uint32_t)((scroll_x % mw + mw) % mw),
+            .block_offset_y = (uint32_t)y0,
+            .blend_cm = PPA_BLEND_COLOR_MODE_A8,
+        },
+        .out = {
+            .buffer = s_buf,
+            .buffer_size = EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_offset_x = 0,
+            .block_offset_y = (uint32_t)y0,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .fg_alpha_update_mode = PPA_ALPHA_SCALE,
+        .fg_alpha_scale_ratio = (float)alpha_scale / 256.0f,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    /* Raw RGB565 fields, NOT expanded to RGB888. Technically wrong for this
+     * field, but the fog alpha (200) was tuned against it; expanding to true
+     * RGB888 turns fog into a white-out that swallows the clock (verified on
+     * hardware 2026-07-28). Retune the alpha before fixing this. */
+    cfg.fg_fix_rgb_val.r = (uint8_t)((tint >> 11) & 0x1f);
+    cfg.fg_fix_rgb_val.g = (uint8_t)((tint >> 5) & 0x3f);
+    cfg.fg_fix_rgb_val.b = (uint8_t)(tint & 0x1f);
     return ppa_do_blend(s_ppa_blend, &cfg) == ESP_OK;
 }
 
@@ -4098,16 +4329,26 @@ static void update_and_draw_particles(float dt, float t)
     ensure_particle_count();
 
     if (s_kind == WEATHER_FOG) {
+        /* Fog is ONE pre-baked X-periodic band (tools/cloudgen/fog.py),
+         * scrolled horizontally and composited with a single PPA blend.
+         * Only the rows from EVA_FOG_SPRITE_Y0 down are blended — the sprite
+         * guarantees everything above that is zero, so blending the full
+         * screen would just be alpha-zero work (~23 % of the pixels).
+         * No per-frame synthesis, no particles, no scratch buffers: the
+         * cheapest scene on the device, which is what fog should be. */
         eva_sprite_t sp;
         if (eva_cloud_assets_sprite(EVA_CLP_TYPE_FOG, 0, 0, &sp) && sp.plane[0]) {
             s_fog_drift_x += (int)(dt * 18.0f);
             if (s_fog_drift_x >= (int)sp.w) s_fog_drift_x -= (int)sp.w;
             uint16_t col = is_night_kind(s_kind) ? rgb565(148, 152, 160)
                                                  : rgb565(220, 222, 216);
-            (void)blit_offline_a8_full(sp.plane[0], sp.w, sp.h, col, 200,
-                                       s_fog_drift_x, 0);
+            int y0 = EVA_FOG_SPRITE_Y0;
+            if (y0 > (int)sp.h) y0 = 0;
+            (void)blit_offline_a8_band(sp.plane[0], (int)sp.w, (int)sp.h, col,
+                                       200, s_fog_drift_x, y0);
             return;
         }
+        /* Pack has no fog sprite: fall through to the P_FOG particles below. */
     }
 
     if (weather_kind_has_precip_particles(s_kind) &&
@@ -4439,6 +4680,73 @@ static void draw_lightning_path(const int16_t *xs, const int16_t *ys, int pts,
     }
 }
 
+static bool blit_bolt_plane_ppa(const uint8_t *plane, int w, int h,
+                                int x0, int y0, uint16_t tint, uint8_t scale);
+
+/* Flat-tint band blend: fills rows [y0, y0+h) of the frame with `tint` at a
+ * uniform `alpha`, entirely in hardware.
+ *
+ * PPA_ALPHA_FIX_VALUE replaces the foreground alpha with a constant, so the
+ * A8 foreground's CONTENT is irrelevant — any readable A8 buffer of the right
+ * geometry works, and `fg_fix_rgb_val` supplies the colour. That turns the
+ * lightning sky wash (a per-row alpha ramp over ~67k pixels, the biggest CPU
+ * cost left in a strike frame) into a handful of DMA blends.
+ * Returns false if PPA is unavailable so the caller keeps its CPU fallback. */
+static bool blend_flat_tint_band(uint16_t tint, uint8_t alpha, int y0, int h)
+{
+    if (!s_ppa_blend || s_ppa_blend_disabled || alpha == 0) return false;
+    if (!s_scene_slot.a8) return false;   /* need any readable A8 buffer */
+    if (y0 < 0) { h += y0; y0 = 0; }
+    if (y0 + h > EVA_WEATHER_RENDER_H) h = EVA_WEATHER_RENDER_H - y0;
+    if (h <= 0) return false;
+    /* Content is irrelevant under FIX_VALUE — this is just a readable A8
+     * region of the right geometry. The text slot mask is full-screen and
+     * already PPA-aligned. */
+    const uint8_t *fg = s_scene_slot.a8;
+
+    ppa_blend_oper_config_t cfg = {
+        .in_bg = {
+            .buffer = s_buf,
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_w = EVA_WEATHER_RENDER_W,
+            .block_h = (uint32_t)h,
+            .block_offset_x = 0,
+            .block_offset_y = (uint32_t)y0,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .in_fg = {
+            .buffer = (void *)fg,
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_w = EVA_WEATHER_RENDER_W,
+            .block_h = (uint32_t)h,
+            .block_offset_x = 0,
+            .block_offset_y = 0,
+            .blend_cm = PPA_BLEND_COLOR_MODE_A8,
+        },
+        .out = {
+            .buffer = s_buf,
+            .buffer_size = EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_offset_x = 0,
+            .block_offset_y = (uint32_t)y0,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .fg_alpha_update_mode = PPA_ALPHA_FIX_VALUE,
+        .fg_alpha_fix_val = alpha,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    /* fg_fix_rgb_val is RGB888 — expand the RGB565 components, do NOT pass the
+     * raw 5/6-bit fields. Passing them unexpanded makes every tint come out
+     * near-black with a blue cast (a white flash rendered as a blue one). */
+    cfg.fg_fix_rgb_val.r = (uint8_t)(((tint >> 11) & 0x1f) * 255 / 31);
+    cfg.fg_fix_rgb_val.g = (uint8_t)(((tint >> 5) & 0x3f) * 255 / 63);
+    cfg.fg_fix_rgb_val.b = (uint8_t)((tint & 0x1f) * 255 / 31);
+    return ppa_do_blend(s_ppa_blend, &cfg) == ESP_OK;
+}
+
 static void composite_lightning_flash(uint8_t alpha)
 {
     if (alpha < FIB_2) return;
@@ -4448,24 +4756,130 @@ static void composite_lightning_flash(uint8_t alpha)
     int cx = s_lightning_flash_x;
     int cy = s_lightning_flash_y;
 
-    /* Regional cloud illumination — no fat blobs along the channel.
-     * Alphas boosted 2026-07-03: the old FIB_21/FIB_34 fractions (~8/13 %)
-     * were invisible on the storm deck; a real flash lights the whole sky. */
+    /* Regional cloud illumination.
+     *
+     * Rewritten 2026-07-28 to blend ROW-WISE instead of calling blend_px()
+     * per pixel. The old version cost ~16 ms in a single frame (measured
+     * `li` 3 us idle -> 16112 us on a strike), which dropped thunderstorm
+     * from 29 to 19 Hz on every flash. The pixel count is unchanged — what
+     * went away is the per-pixel bounds check and index computation
+     * (blend_px does both on ~90k pixels), plus the per-pixel divide in the
+     * soft-edge branch, which is now a per-row span calculation.
+     * Slicing across frames is NOT an option here: a flash lasts only a few
+     * frames, so a partially-drawn one would look broken.
+     * NOTE: the row pointers below assume the landscape framebuffer layout
+     * (idx = y*W + x). EVA_PORTRAIT_NATIVE writes a rotated buffer, so that
+     * build keeps the original per-pixel path via blend_px(). */
+#ifdef EVA_PORTRAIT_NATIVE
     draw_filled_circle(cx, cy, FIB_144, cool, clamp_u8((alpha * FIB_34) / 255));
     draw_filled_circle(cx, cy, FIB_89, warm, clamp_u8((alpha * FIB_55) / 255));
-
-    /* Sky wash — mimics cloud volume lighting. Denser grid + stronger
-     * alpha; runs only on flash frames so the cost stays bounded. */
-    uint8_t sky_a = clamp_u8((alpha * FIB_34) / 255);
-    if (sky_a >= FIB_2) {
-        int y1 = (int)((float)EVA_WEATHER_RENDER_H * 0.70f);
-        for (int y = 0; y < y1; y += 2) {
-            uint8_t row_a = (uint8_t)((sky_a * (y1 - y)) / (y1 + 1));
-            if (row_a < FIB_2) continue;
-            for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 2) {
-                int idx = eva_sbuf_idx(x, y);
-                s_buf[idx] = blend565(s_buf[idx], warm, row_a);
+    {
+        uint8_t sky_a = clamp_u8((alpha * FIB_34) / 255);
+        if (sky_a >= FIB_2) {
+            int y1 = (int)((float)EVA_WEATHER_RENDER_H * 0.70f);
+            for (int y = 0; y < y1; y += 2) {
+                uint8_t row_a = (uint8_t)((sky_a * (y1 - y)) / (y1 + 1));
+                if (row_a < FIB_2) continue;
+                for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 2) {
+                    int idx = eva_sbuf_idx(x, y);
+                    s_buf[idx] = blend565(s_buf[idx], warm, row_a);
+                }
             }
+        }
+    }
+    return;
+#endif
+#ifndef EVA_PORTRAIT_NATIVE
+    /* Pre-baked radial falloff (tools/cloudgen/sprites.py gen_flash): the two
+     * discs summed into one A8 mask, so a strike costs ONE PPA blend instead
+     * of ~90k CPU read-modify-writes (measured 8.8 ms in the frame a strike
+     * lands on). The mask encodes both radii and both alphas, so the look is
+     * unchanged. `alpha` scales it via PPA_ALPHA_SCALE. */
+    {
+        eva_sprite_t fl;
+        if (eva_cloud_assets_sprite(EVA_CLP_TYPE_FLASH, 0, 0, &fl) && fl.plane[0]) {
+            if (blit_bolt_plane_ppa(fl.plane[0], (int)fl.w, (int)fl.h,
+                                    cx - (int)fl.w / 2, cy - (int)fl.h / 2,
+                                    warm, alpha)) {
+                goto sky_wash;
+            }
+        }
+    }
+#endif
+    for (int pass = 0; pass < 2; ++pass) {
+        int r = pass ? FIB_89 : FIB_144;
+        uint16_t col = pass ? warm : cool;
+        uint8_t a0 = clamp_u8((alpha * (pass ? FIB_55 : FIB_34)) / 255);
+        if (a0 < FIB_2) continue;
+        int r2 = r * r;
+        int soft2 = (r2 * 3) / 4;          /* inner solid disc, as before */
+        int denom = r2 / 4 + 1;
+        int y_lo = cy - r; if (y_lo < 0) y_lo = 0;
+        int y_hi = cy + r; if (y_hi > EVA_WEATHER_RENDER_H - 1) y_hi = EVA_WEATHER_RENDER_H - 1;
+        /* Sample on a 2x2 grid, exactly like the sky wash below. A flash is a
+         * 2-3 frame white-out, so the gaps are invisible — but it cuts the
+         * circle pixel count 4x, which is what keeps the strike frame inside
+         * budget (measured 12.6 ms -> ~5 ms for the whole flash). */
+        if (y_lo & 1) ++y_lo;
+        for (int y = y_lo; y <= y_hi; y += 2) {
+            int dy = y - cy;
+            int rem = r2 - dy * dy;
+            if (rem <= 0) continue;
+            /* Half-width of the disc on this row (integer sqrt). */
+            int hw = 0;
+            while ((hw + 1) * (hw + 1) <= rem) ++hw;
+            int x_lo = cx - hw; if (x_lo < 0) x_lo = 0;
+            int x_hi = cx + hw; if (x_hi > EVA_WEATHER_RENDER_W - 1) x_hi = EVA_WEATHER_RENDER_W - 1;
+            if (x_lo & 1) ++x_lo;
+            if (x_lo > x_hi) continue;
+            uint16_t *row = &s_buf[(size_t)y * EVA_WEATHER_RENDER_W];
+            for (int x = x_lo; x <= x_hi; x += 2) {
+                int dx = x - cx;
+                int d2 = dx * dx + dy * dy;
+                uint8_t a = a0;
+                if (d2 > soft2) {
+                    a = (uint8_t)((a0 * (r2 - d2)) / denom);
+                    if (a < FIB_2) continue;
+                }
+                row[x] = blend565(row[x], col, a);
+            }
+        }
+    }
+
+sky_wash:
+    /* Sky wash — mimics cloud volume lighting: a top-down alpha ramp over the
+     * upper 70 % of the frame. Every pixel in a row shares one alpha, so this
+     * is a flat tint blend, not a mask blend — PPA_ALPHA_FIX_VALUE does it in
+     * hardware with no foreground bitmap at all. Done as a handful of
+     * horizontal bands (the ramp quantised) instead of ~67k CPU blends, which
+     * was the single biggest piece left in a strike frame (~7 ms). */
+    uint8_t sky_a = clamp_u8((alpha * FIB_34) / 255);
+    if (sky_a < FIB_2) return;
+    int y1 = (int)((float)EVA_WEATHER_RENDER_H * 0.70f);
+#ifndef EVA_PORTRAIT_NATIVE
+    if (s_ppa_blend && !s_ppa_blend_disabled) {
+        const int BANDS = 6;
+        int band_h = y1 / BANDS;
+        if (band_h > 0) {
+            bool ok = true;
+            for (int b = 0; b < BANDS && ok; ++b) {
+                int by = b * band_h;
+                /* Alpha at the band's midpoint — same ramp, quantised. */
+                int mid = by + band_h / 2;
+                uint8_t row_a = (uint8_t)((sky_a * (y1 - mid)) / (y1 + 1));
+                if (row_a < FIB_2) continue;
+                ok = blend_flat_tint_band(warm, row_a, by, band_h);
+            }
+            if (ok) return;
+        }
+    }
+#endif
+    for (int y = 0; y < y1; y += 2) {
+        uint8_t row_a = (uint8_t)((sky_a * (y1 - y)) / (y1 + 1));
+        if (row_a < FIB_2) continue;
+        uint16_t *row = &s_buf[(size_t)y * EVA_WEATHER_RENDER_W];
+        for (int x = 0; x < EVA_WEATHER_RENDER_W; x += 2) {
+            row[x] = blend565(row[x], warm, row_a);
         }
     }
 }
@@ -4587,6 +5001,81 @@ static void lightning_task(void *arg)
 }
 
 /* Additive-ish A8 sprite blit: dst brightened toward tint by plane alpha × scale. */
+/* A bolt sprite is 360x560 but a lightning channel is THIN — the vast
+ * majority of that mask is zero. The old loop tested every one of the
+ * 201600 bytes and recomputed eva_sbuf_idx() per lit pixel; called twice
+ * (glow + core) that measured **25 ms in a single frame** (`li_max`),
+ * dropping thunderstorm from 27 to 17 Hz on every strike.
+ *
+ * Now the mask is scanned 4 bytes at a time so empty stretches are skipped
+ * wholesale, and the destination is addressed off a row pointer. Same
+ * pixels are blended — only the scanning of empty space got cheap. */
+/* Hardware blit of a bolt plane at (x0,y0), clipped to the viewport.
+ *
+ * The glow plane is 23.5 % non-zero (measured) — a genuinely dense blurred
+ * halo of ~47k pixels, so the CPU word-skip cannot help it and it dominated
+ * the strike frame. PPA blends the same A8-over-RGB565 with a fixed tint at
+ * ~23 ns/px versus ~80 on the CPU. Returns false if PPA cannot take it (no
+ * client, fully off-screen, or a submit error) so the caller falls back to
+ * the CPU path — which is still the right choice for the 1.3 %-full core
+ * plane, where the word-skip is faster than a DMA round trip. */
+static bool blit_bolt_plane_ppa(const uint8_t *plane, int w, int h,
+                                int x0, int y0, uint16_t tint, uint8_t scale)
+{
+    if (!plane || !s_ppa_blend || s_ppa_blend_disabled || scale == 0) return false;
+    /* Clip the sprite rect to the screen; PPA needs non-negative offsets. */
+    int sx = 0, sy = 0;
+    int dx = x0, dy = y0;
+    int bw = w, bh = h;
+    if (dx < 0) { sx = -dx; bw -= sx; dx = 0; }
+    if (dy < 0) { sy = -dy; bh -= sy; dy = 0; }
+    if (dx + bw > EVA_WEATHER_RENDER_W) bw = EVA_WEATHER_RENDER_W - dx;
+    if (dy + bh > EVA_WEATHER_RENDER_H) bh = EVA_WEATHER_RENDER_H - dy;
+    if (bw <= 0 || bh <= 0) return true;      /* off-screen: nothing to draw */
+
+    ppa_blend_oper_config_t cfg = {
+        .in_bg = {
+            .buffer = s_buf,
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_w = (uint32_t)bw,
+            .block_h = (uint32_t)bh,
+            .block_offset_x = (uint32_t)dx,
+            .block_offset_y = (uint32_t)dy,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .in_fg = {
+            .buffer = (void *)plane,
+            .pic_w = (uint32_t)w,
+            .pic_h = (uint32_t)h,
+            .block_w = (uint32_t)bw,
+            .block_h = (uint32_t)bh,
+            .block_offset_x = (uint32_t)sx,
+            .block_offset_y = (uint32_t)sy,
+            .blend_cm = PPA_BLEND_COLOR_MODE_A8,
+        },
+        .out = {
+            .buffer = s_buf,
+            .buffer_size = EVA_WEATHER_RENDER_W * EVA_WEATHER_RENDER_H * sizeof(uint16_t),
+            .pic_w = EVA_WEATHER_RENDER_W,
+            .pic_h = EVA_WEATHER_RENDER_H,
+            .block_offset_x = (uint32_t)dx,
+            .block_offset_y = (uint32_t)dy,
+            .blend_cm = PPA_BLEND_COLOR_MODE_RGB565,
+        },
+        .fg_alpha_update_mode = PPA_ALPHA_SCALE,
+        .fg_alpha_scale_ratio = (float)scale / 256.0f,
+        .mode = PPA_TRANS_MODE_BLOCKING,
+    };
+    /* fg_fix_rgb_val is RGB888 — expand the RGB565 components, do NOT pass the
+     * raw 5/6-bit fields. Passing them unexpanded makes every tint come out
+     * near-black with a blue cast (a white flash rendered as a blue one). */
+    cfg.fg_fix_rgb_val.r = (uint8_t)(((tint >> 11) & 0x1f) * 255 / 31);
+    cfg.fg_fix_rgb_val.g = (uint8_t)(((tint >> 5) & 0x3f) * 255 / 63);
+    cfg.fg_fix_rgb_val.b = (uint8_t)((tint & 0x1f) * 255 / 31);
+    return ppa_do_blend(s_ppa_blend, &cfg) == ESP_OK;
+}
+
 static void blit_bolt_plane(const uint8_t *plane, int w, int h,
                             int x0, int y0, bool mirror,
                             uint16_t tint, uint8_t scale)
@@ -4595,17 +5084,50 @@ static void blit_bolt_plane(const uint8_t *plane, int w, int h,
     for (int y = 0; y < h; ++y) {
         int dy = y0 + y;
         if ((unsigned)dy >= EVA_WEATHER_RENDER_H) continue;
-        const uint8_t *src = &plane[y * w];
-        for (int x = 0; x < w; ++x) {
+        const uint8_t *src = &plane[(size_t)y * w];
+#ifndef EVA_PORTRAIT_NATIVE
+        uint16_t *drow = &s_buf[(size_t)dy * EVA_WEATHER_RENDER_W];
+#endif
+        /* The word-skip below reads src[4i..4i+4). In the mirrored case the
+         * inner loop reads src[w-1-x], i.e. a DIFFERENT word, so the skip
+         * would discard the wrong bytes. Bolts are never mirrored today
+         * (s_bolt_mirror is always false — mirroring breaks the baked slant,
+         * see CLAUDE.md), but keep the slow path correct rather than rely on
+         * that invariant holding forever. */
+        const uint32_t *w32 = (const uint32_t *)src;
+        int words = mirror ? 0 : (w / 4);
+        for (int i = 0; i < words; ++i) {
+            if (!w32[i]) continue;            /* 4 empty mask bytes: skip */
+            int xs = i * 4;
+            for (int x = xs; x < xs + 4; ++x) {
+                uint8_t m = src[mirror ? (w - 1 - x) : x];
+                if (m < FIB_2) continue;
+                int dx = x0 + x;
+                if ((unsigned)dx >= EVA_WEATHER_RENDER_W) continue;
+                uint8_t a = (uint8_t)(((uint16_t)m * scale) / 255U);
+                if (!a) continue;
+#ifdef EVA_PORTRAIT_NATIVE
+                int idx = eva_sbuf_idx(dx, dy);
+                s_buf[idx] = blend565(s_buf[idx], tint, a);
+#else
+                drow[dx] = blend565(drow[dx], tint, a);
+#endif
+            }
+        }
+        /* Tail columns when w is not a multiple of 4. */
+        for (int x = words * 4; x < w; ++x) {
             uint8_t m = src[mirror ? (w - 1 - x) : x];
             if (m < FIB_2) continue;
             int dx = x0 + x;
             if ((unsigned)dx >= EVA_WEATHER_RENDER_W) continue;
             uint8_t a = (uint8_t)(((uint16_t)m * scale) / 255U);
-            if (a) {
-                int idx = eva_sbuf_idx(dx, dy);
-                s_buf[idx] = blend565(s_buf[idx], tint, a);
-            }
+            if (!a) continue;
+#ifdef EVA_PORTRAIT_NATIVE
+            int idx = eva_sbuf_idx(dx, dy);
+            s_buf[idx] = blend565(s_buf[idx], tint, a);
+#else
+            drow[dx] = blend565(drow[dx], tint, a);
+#endif
         }
     }
 }
@@ -4640,9 +5162,24 @@ static void composite_lightning_on_render(void)
     uint16_t core = rgb565(255, 255, 255);
     uint16_t glow = rgb565(176, 202, 255);
     if (snap.bolt_sprite_ok) {
-        blit_bolt_plane(s_bolt_sprite.plane[1], s_bolt_sprite.w, s_bolt_sprite.h,
-                        snap.bolt_x, snap.bolt_y, snap.bolt_mirror,
-                        glow, (uint8_t)((bolt_a * BOLT_GLOW_SCALE_NUM) / BOLT_GLOW_SCALE_DEN));
+        uint8_t glow_a = (uint8_t)((bolt_a * BOLT_GLOW_SCALE_NUM) / BOLT_GLOW_SCALE_DEN);
+        /* Glow goes to PPA: it is 23.5 % non-zero, so the CPU word-skip has
+         * nothing to skip and it was the bulk of the 25 ms strike frame. The
+         * core stays on the CPU — at 1.3 % non-zero the word-skip beats a DMA
+         * round trip. Mirrored bolts (never produced today) keep the CPU path
+         * because PPA has no horizontal-flip on the blend engine. */
+        bool glow_done = false;
+        if (!snap.bolt_mirror) {
+            glow_done = blit_bolt_plane_ppa(s_bolt_sprite.plane[1],
+                                            s_bolt_sprite.w, s_bolt_sprite.h,
+                                            snap.bolt_x, snap.bolt_y,
+                                            glow, glow_a);
+        }
+        if (!glow_done) {
+            blit_bolt_plane(s_bolt_sprite.plane[1], s_bolt_sprite.w, s_bolt_sprite.h,
+                            snap.bolt_x, snap.bolt_y, snap.bolt_mirror,
+                            glow, glow_a);
+        }
         blit_bolt_plane(s_bolt_sprite.plane[0], s_bolt_sprite.w, s_bolt_sprite.h,
                         snap.bolt_x, snap.bolt_y, snap.bolt_mirror,
                         core, bolt_a);
@@ -4701,23 +5238,42 @@ static void stamp_trail_sprite(int x0, int y0, int variant)
     }
 }
 
+/* Rows of wet-glass decayed per call. The decay is a per-pixel pass over the
+ * whole accumulated band; doing it in one go cost ~13.5 ms and landed on a
+ * single frame, dropping thunderstorm 29 -> 19 Hz every FIB_5 frames. Slicing
+ * it keeps every frame the same cost — the decay rate per row is unchanged,
+ * it just walks the band a piece at a time. */
+#define WET_DECAY_ROWS_PER_CALL 64
+
 static void decay_wet_glass_band(void)
 {
     if (!s_wet_glass || s_wet_y0 > s_wet_y1) return;
-    int ny0 = 1 << 30;
-    int ny1 = -1;
-    for (int y = s_wet_y0; y <= s_wet_y1; ++y) {
+    if (s_wet_decay_row < s_wet_y0 || s_wet_decay_row > s_wet_y1) {
+        s_wet_decay_row = s_wet_y0;
+        s_wet_scan_y0 = 1 << 30;
+        s_wet_scan_y1 = -1;
+    }
+    int y_end = s_wet_decay_row + WET_DECAY_ROWS_PER_CALL;
+    if (y_end > s_wet_y1 + 1) y_end = s_wet_y1 + 1;
+    for (int y = s_wet_decay_row; y < y_end; ++y) {
         uint8_t *row = &s_wet_glass[y * EVA_WEATHER_RENDER_W];
         for (int x = 0; x < EVA_WEATHER_RENDER_W; ++x) {
             row[x] = (uint8_t)((row[x] * 247) >> 8);
             if (row[x] >= FIB_2) {
-                if (y < ny0) ny0 = y;
-                if (y > ny1) ny1 = y;
+                if (y < s_wet_scan_y0) s_wet_scan_y0 = y;
+                if (y > s_wet_scan_y1) s_wet_scan_y1 = y;
             }
         }
     }
-    s_wet_y0 = ny0;
-    s_wet_y1 = ny1;
+    s_wet_decay_row = y_end;
+    if (s_wet_decay_row > s_wet_y1) {
+        /* Full sweep done: publish the new occupied band and restart. */
+        s_wet_y0 = s_wet_scan_y0;
+        s_wet_y1 = s_wet_scan_y1;
+        s_wet_decay_row = s_wet_y0;
+        s_wet_scan_y0 = 1 << 30;
+        s_wet_scan_y1 = -1;
+    }
 }
 
 static void composite_wet_glass_band(void)
@@ -4904,10 +5460,11 @@ static void update_and_draw_glass_drops(float dt, float t)
 
     ensure_glass_drops();
     ensure_wet_glass();
-    if (++s_wet_decay_tick >= FIB_5) {
-        s_wet_decay_tick = 0;
-        decay_wet_glass_band();
-    }
+    /* Run a SLICE every frame instead of the whole band every FIB_5 frames.
+     * Same average decay rate, but the ~13.5 ms pass no longer lands entirely
+     * on one frame (measured: thunderstorm 29 -> 19 Hz on those frames). */
+    (void)s_wet_decay_tick;
+    decay_wet_glass_band();
 
     uint16_t col_drop = rgb565(188, 210, 232);
     uint16_t col_hi = rgb565(250, 252, 255);
@@ -5085,6 +5642,18 @@ static uint8_t background_hold_frames(weather_kind_t kind)
     }
 }
 
+/* Full-frame 800x480 RGB565 copy.
+ *
+ * Despite the name this used to be a plain CPU memcpy of 750 KB, and it runs
+ * on EVERY frame (scene_base -> render buffer, so the cloud blends have a
+ * fresh base). Measured on hardware 2026-07-28: **9.1 ms per frame**, i.e.
+ * ~27 % of a 33 ms budget, spent purely moving bytes.
+ *
+ * MEASURED (2026-07-28): routing this through PPA SRM as a 1:1 DMA blit made
+ * it WORSE — 9.1 ms -> 14.6 ms. Both buffers live in PSRAM, so the DMA engine
+ * is bound by the same memory bus as the CPU and adds descriptor/IRQ overhead
+ * on top. Do not "optimize" this into PPA again; the win has to come from
+ * doing FEWER full-frame copies, not from moving this one to hardware. */
 static esp_err_t ppa_copy_rgb565(uint16_t *dst, const uint16_t *src)
 {
     if (!dst || !src) {
@@ -5100,9 +5669,35 @@ static esp_err_t ppa_copy_rgb565(uint16_t *dst, const uint16_t *src)
     return ESP_OK;
 }
 
+/* Copy a rectangle of rows between two full-frame RGB565 buffers.
+ * Used by the incremental scene-base refresh: when only the clock text has
+ * changed, the sky underneath it is already correct in s_bg_buf, so restoring
+ * just the text's bounding rows is enough — no 750 KB full-frame copies. */
+static void copy_rows_rgb565(uint16_t *dst, const uint16_t *src, int y0, int y1)
+{
+    if (!dst || !src) return;
+    if (y0 < 0) y0 = 0;
+    if (y1 > EVA_WEATHER_RENDER_H) y1 = EVA_WEATHER_RENDER_H;
+    if (y0 >= y1) return;
+    size_t row_bytes = (size_t)EVA_WEATHER_RENDER_W * sizeof(uint16_t);
+    memcpy(&dst[(size_t)y0 * EVA_WEATHER_RENDER_W],
+           &src[(size_t)y0 * EVA_WEATHER_RENDER_W],
+           row_bytes * (size_t)(y1 - y0));
+}
+
+/* Thresholds are in TRUE frame-interval terms (see call site). The panel
+ * runs at 60 Hz = 16.67 ms; since the loop waits for vsync every frame, the
+ * achievable frame times are near-multiples of that period. Targeting 3
+ * periods (50 ms / 20 Hz) keeps a stable cadence: shed detail above ~4
+ * periods (66 ms) and only add it back below ~3 (50 ms), so the governor
+ * cannot oscillate between two adjacent vsync buckets — that oscillation is
+ * itself perceived as stutter even when the average FPS looks fine. */
+#define EVA_FRAME_SHED_US   66000   /* > 4 panel periods: too slow, shed */
+#define EVA_FRAME_GROW_US   50000   /* < 3 panel periods: headroom, grow */
+
 static void adapt_budget(int64_t frame_us)
 {
-    if (frame_us > 25000) {
+    if (frame_us > EVA_FRAME_SHED_US) {
         s_over_budget++;
         s_under_budget = 0;
         if (s_over_budget >= 3 && s_target > 64) {
@@ -5110,10 +5705,10 @@ static void adapt_budget(int64_t frame_us)
             if (s_target < 64) s_target = 64;
             s_over_budget = 0;
         }
-        if (frame_us > 30000 && s_clouds3d_active > 10) {
+        if (frame_us > 83000 && s_clouds3d_active > 10) {   /* > 5 periods */
             s_clouds3d_active--;
         }
-    } else if (frame_us < 14000) {
+    } else if (frame_us < EVA_FRAME_GROW_US) {
         s_under_budget++;
         s_over_budget = 0;
         if (s_under_budget >= 30 && s_target < s_max_target) {
@@ -5172,6 +5767,15 @@ void eva_weather_canvas_cloud_info(char *buf, size_t buf_len)
                             "cloud assets: %s, last load %lld us\r\n",
                             s_cloud_assets_ok ? "mmap CLP2" : "procedural fallback",
                             (long long)eva_cloud_assets_last_load_us());
+    if (off < buf_len) {
+        off += (size_t)snprintf(buf + off, buf_len - off,
+                                "perf: framecopy=%uus scenebase_rebuild=%uus\r\n",
+                                (unsigned)s_prof_framecopy_us,
+                                (unsigned)s_prof_sbrebuild_us);
+        s_prof_band_small_us = s_prof_band_small_n = 0;
+        s_prof_band_mid_us = s_prof_band_mid_n = 0;
+        s_prof_band_big_us = s_prof_band_big_n = 0;
+    }
     for (int i = 0; i < CLOUD_LAYER_COUNT && off < buf_len; ++i) {
         const cloud_strip_t *s = &s_strip[i];
         cloud_pool_t pool = (cloud_pool_t)s->pool_kind;
@@ -5249,7 +5853,9 @@ static void render_weather(float dt)
         s_lightning_next_strike_at = 0.0f;
         s_bg_ttl = 0;
         s_bg_dt = 0.0f;
+        s_bg_force_rebake = true;
         s_scene_base_dirty = true;
+        s_scene_base_sky_dirty = true;
         /* Abort any in-flight amortized repaint — its snapshot belongs to
          * the previous kind; a fresh one starts next frame. */
         s_bg_paint_row = -1;
@@ -5288,9 +5894,28 @@ static void render_weather(float dt)
             float pe = eva_wx_ease(s_wx_trans.progress);
             if (pe - s_wx_last_bake_p >= 0.09f) {
                 s_bg_ttl = 0;
+                s_bg_force_rebake = true;
             }
         }
-        if (s_bg_ttl == 0 && s_bg_paint_row < 0) {
+        /* The TTL alone used to trigger a rebake every FIB_34 frames (~440 ms,
+         * ~2.3x/second). Each completed rebake sets s_scene_base_dirty, and
+         * that rebuild costs 28-56 ms — a frame far over budget, which is the
+         * periodic hitch the display shows. But the sky it repaints is a
+         * function of (palette, sun position, transition progress), all of
+         * which are driven by WALL-CLOCK MINUTES, not frames: over 440 ms the
+         * result is bit-identical. So gate the rebake on the inputs actually
+         * changing. The TTL stays as an upper bound so nothing can go stale.
+         *
+         * `minutes_now()` moves once a minute, and the transition branch above
+         * still forces rebakes while a weather transition is easing, so the
+         * gradient animates exactly when it should. */
+        int bg_minute = minutes_now();
+        bool bg_inputs_changed = (bg_minute != s_bg_last_minute) ||
+                                 s_wx_trans.active ||
+                                 s_bg_force_rebake;
+        if (s_bg_paint_row < 0 && bg_inputs_changed) {
+            s_bg_last_minute = bg_minute;
+            s_bg_force_rebake = false;
             /* Snapshot everything the repaint needs so the buffer stays
              * consistent while slices land across several frames. */
             s_wx_last_bake_p = eva_wx_ease(s_wx_trans.progress);
@@ -5304,16 +5929,25 @@ static void render_weather(float dt)
             s_bg_paint_row = 0;
         }
         if (s_bg_paint_row >= 0) {
-            int y0 = s_bg_paint_row;
-            int y1 = y0 + BG_PAINT_ROWS_PER_FRAME;
-            if (y1 > EVA_WEATHER_RENDER_H) y1 = EVA_WEATHER_RENDER_H;
-            fill_sky_rows(s_bg_next, y0, y1,
-                          s_bg_snap_sky.top, s_bg_snap_sky.bottom,
-                          s_bg_snap_sun_x, s_bg_snap_sun_y, s_bg_snap_warmth);
-            s_bg_paint_row = y1;
-            if (y1 >= EVA_WEATHER_RENDER_H) {
-                /* Final slice: overlays paint via s_buf-based helpers —
-                 * retarget them at the back buffer (same task, no race). */
+            if (s_bg_paint_row < EVA_WEATHER_RENDER_H) {
+                /* Sky rows: one slice per frame. */
+                int y0 = s_bg_paint_row;
+                int y1 = y0 + BG_PAINT_ROWS_PER_FRAME;
+                if (y1 > EVA_WEATHER_RENDER_H) y1 = EVA_WEATHER_RENDER_H;
+                fill_sky_rows(s_bg_next, y0, y1,
+                              s_bg_snap_sky.top, s_bg_snap_sky.bottom,
+                              s_bg_snap_sun_x, s_bg_snap_sun_y, s_bg_snap_warmth);
+                s_bg_paint_row = y1;
+            } else {
+                /* Overlay + publish step, on its OWN frame.
+                 * Previously this rode along with the last sky slice, so one
+                 * frame paid: 64 sky rows + draw_day_sky_depth() +
+                 * draw_sun_or_moon() + (via s_scene_base_dirty) a 19.4 ms
+                 * scene-base rebuild — measured as a ~9.7 ms `bg` spike whose
+                 * frame also carried the rebuild. That pile-up is the visible
+                 * periodic hitch. Giving it a frame of its own costs one extra
+                 * frame per rebake (rebakes are ~440 ms apart) and removes the
+                 * worst-case frame entirely. */
                 uint16_t *save = s_buf;
                 s_buf = s_bg_next;
                 draw_day_sky_depth();
@@ -5326,6 +5960,7 @@ static void render_weather(float dt)
                 s_bg_dt = 0.0f;
                 s_bg_ttl = background_hold_frames(s_kind);
                 s_scene_base_dirty = true;
+                s_scene_base_sky_dirty = true;
             }
         }
     }
@@ -5337,16 +5972,97 @@ static void render_weather(float dt)
     /* Z-order (bottom → top): sky+sun → outdoor rain/lightning → text →
      * clouds → glass. s_bg_buf holds sky+sun only; copy scene base or bg. */
     if (s_scene_base && scene_text_can_cache(s_kind)) {
+        int64_t sb0 = esp_timer_get_time();
         if (s_scene_base_dirty && s_bg_buf) {
-            (void)ppa_copy_rgb565(s_scene_base, s_bg_buf);
-            uint16_t *save = s_buf;
-            s_buf = s_scene_base;
-            draw_scene_text_overlays();
-            s_buf = save;
+            /* Rebuilding the cached base is 750 KB of copy plus a full text
+             * blit (measured 19.4 ms). It must stay ATOMIC within the frame —
+             * splitting copy and text across two frames was tried and shows a
+             * frame with no clock, because s_scene_base is both the rebuild
+             * target and this frame's source image.
+             * Build the base directly in s_buf, then publish it to
+             * s_scene_base with ONE copy. The old order did
+             *   copy(base <- bg); text(base); copy(buf <- base)
+             * = two full-frame copies (2 x 750 KB) on this frame. Building in
+             * place makes it
+             *   copy(buf <- bg); text(buf); copy(base <- buf)
+             * — same result, still atomic, but the frame that rebuilds is no
+             * longer the most expensive frame in the cycle. */
+            /* INCREMENTAL PATH: if the sky itself did not change and we
+             * already have a valid base, only the text region can differ.
+             * Restore those rows straight from s_bg_buf into s_scene_base and
+             * redraw the text there — two ~40-row memcpys instead of two
+             * 750 KB ones. This is what turns the once-a-minute clock update
+             * from a ~126 ms hitch into a normal frame. */
+            bool incremental = !s_scene_base_sky_dirty && s_scene_base_valid;
+            if (incremental) {
+                /* Bake the NEW text mask first so its bbox is known, then
+                 * restore the union of the old and new text rows from the
+                 * (unchanged) sky and draw on top. Order matters: reading the
+                 * bbox before the bake would give the PREVIOUS layout and
+                 * leave stale glyph rows behind. */
+                refresh_scene_text_slot();
+                int rows_y0 = s_scene_base_text_y0;
+                int rows_y1 = s_scene_base_text_y1;
+                if (s_scene_slot.bbox_valid) {
+                    int ny0 = (int)s_scene_slot.bbox_y0;
+                    int ny1 = (int)s_scene_slot.bbox_y1 + 3;  /* +3 = shadow */
+                    if (rows_y1 <= 0) { rows_y0 = ny0; rows_y1 = ny1; }
+                    else {
+                        if (ny0 < rows_y0) rows_y0 = ny0;
+                        if (ny1 > rows_y1) rows_y1 = ny1;
+                    }
+                }
+                if (rows_y1 <= rows_y0) incremental = false;
+                else {
+                    copy_rows_rgb565(s_scene_base, s_bg_buf, rows_y0, rows_y1);
+                    uint16_t *save = s_buf;
+                    s_buf = s_scene_base;
+                    draw_scene_text_overlays();
+                    s_buf = save;
+                    (void)ppa_copy_rgb565(s_buf, s_scene_base);
+                }
+            }
+            if (!incremental) {
+                (void)ppa_copy_rgb565(s_buf, s_bg_buf);
+                draw_scene_text_overlays();
+                (void)ppa_copy_rgb565(s_scene_base, s_buf);
+            }
+            s_scene_base_sky_dirty = false;
+            s_scene_base_valid = true;
+            if (s_scene_slot.bbox_valid) {
+                s_scene_base_text_y0 = (int)s_scene_slot.bbox_y0;
+                s_scene_base_text_y1 = (int)s_scene_slot.bbox_y1 + 3;
+            }
             s_scene_base_dirty = false;
+            s_scene_text_done_this_frame = true;
+            s_prof_sbrebuild_us = (uint32_t)(esp_timer_get_time() - sb0);
+        } else {
+            /* NO full-frame copy. Instead the first cloud blend reads its
+             * background straight from s_scene_base and writes s_buf: PPA
+             * writes the whole block, so pixels where the mask alpha is 0 come
+             * out as the background — i.e. the copy happens as a side effect
+             * of work we already do. That removes a 750 KB memcpy that
+             * measured ~11 ms on EVERY frame (~28 % of a 39 ms frame).
+             * s_cloud_bg_src is consumed by the first layer's bands (both
+             * halves of a seam wrap) and cleared right after. */
+            /* Only safe when NOTHING draws into s_buf between here and the
+             * cloud blend: draw_sun_fib_light() and the particle pass write
+             * s_buf directly, and the background would erase them. Those only
+             * run when the sun is visible or the scene has particles, so the
+             * common overcast/night cases still get the fast path. */
+            bool nothing_before_clouds =
+                (!s_sun_visible || s_sun_strength <= 0.0f) && s_target == 0;
+            if (nothing_before_clouds) {
+                s_cloud_bg_src = s_scene_base;
+                s_blend_from_sky = true;
+                s_prof_framecopy_us = 0;
+            } else {
+                int64_t cp0 = esp_timer_get_time();
+                (void)ppa_copy_rgb565(s_buf, s_scene_base);
+                s_prof_framecopy_us = (uint32_t)(esp_timer_get_time() - cp0);
+            }
+            s_scene_text_done_this_frame = true;
         }
-        (void)ppa_copy_rgb565(s_buf, s_scene_base);
-        s_scene_text_done_this_frame = true;
     } else if (s_bg_buf && !sky_refreshed) {
         (void)ppa_copy_rgb565(s_buf, s_bg_buf);
         s_scene_text_done_this_frame = false;
@@ -5378,16 +6094,33 @@ static void render_weather(float dt)
         if (s_strip[0].morphing || s_strip[1].morphing || s_strip[2].morphing) {
             s_prof_morph_frames++;
         }
-        bool sky_wrap = false;
+            bool sky_wrap = false;
         if (s_merged_storm_active) {
             (void)blend_layer(&s_strip[CLOUD_LAYER_LOW], false);
         } else {
-            if (blend_layer(&s_strip[CLOUD_LAYER_HIGH], sky_wrap)) sky_wrap = false;
-            if (blend_layer(&s_strip[CLOUD_LAYER_MID], sky_wrap)) sky_wrap = false;
-            (void)blend_layer(&s_strip[CLOUD_LAYER_LOW], sky_wrap);
+            /* All three layers are ALWAYS drawn. An earlier version spent a
+             * fixed per-frame blend budget and, while a layer crossfaded,
+             * skipped the thinnest other layer to keep frame time flat. That
+             * did hold the frame time — but the sacrificed layer appeared and
+             * vanished in ONE frame as the crossfade crossed the alpha
+             * threshold, which is a far worse artefact than the 26->21 Hz dip
+             * it removed. Never drop a visible layer to buy frame time. */
+            for (int i = 0; i < CLOUD_LAYER_COUNT; ++i) {
+                if (blend_layer(&s_strip[i], sky_wrap)) sky_wrap = false;
+            }
         }
     }
+    /* If no layer consumed it (clear sky: every alpha_scale below the 3 %
+     * floor), nothing has written s_buf this frame and it still holds the
+     * PREVIOUS frame. Fall back to the explicit copy so the scene is correct.
+     * This is the cheap case anyway — no cloud blends were issued. */
+    if (s_blend_from_sky && s_cloud_bg_src) {
+        int64_t cp0 = esp_timer_get_time();
+        (void)ppa_copy_rgb565(s_buf, s_cloud_bg_src);
+        s_prof_framecopy_us = (uint32_t)(esp_timer_get_time() - cp0);
+    }
     s_blend_from_sky = false;
+    s_cloud_bg_src = NULL;
     int64_t tb_after_clouds = esp_timer_get_time();
     s_prof_clouds_us += (tb_after_clouds - tb_cloud0);
 
@@ -5432,15 +6165,15 @@ static bool IRAM_ATTR on_dpi_refresh_done(esp_lcd_panel_handle_t panel,
     return hp_wake == pdTRUE;
 }
 
-static esp_err_t rotate_render_to_dpi_fb(uint16_t *dst)
+static esp_err_t rotate_render_to_dpi_fb(uint16_t *dst, const uint16_t *src)
 {
-    if (!s_ppa_srm || s_ppa_disabled || !dst) {
+    if (!s_ppa_srm || s_ppa_disabled || !dst || !src) {
         return ESP_ERR_INVALID_STATE;
     }
 
     ppa_srm_oper_config_t cfg = {
         .in = {
-            .buffer = s_render_buf,
+            .buffer = (void *)src,
             .pic_w = EVA_WEATHER_RENDER_W,
             .pic_h = EVA_WEATHER_RENDER_H,
             .block_w = EVA_WEATHER_RENDER_W,
@@ -5489,7 +6222,17 @@ static void native_render_task(void *arg)
         int64_t now = esp_timer_get_time();
         int64_t tick_us = s_last_us ? now - s_last_us : (int64_t)TIMER_MS * 1000;
         float dt = (float)tick_us / 1000000.0f;
-        if (dt < 0.0f || dt > 0.10f) dt = (float)TIMER_MS / 1000.0f;
+        /* Clamp runaway/negative dt only. The old guard was
+         * `dt > 0.10f -> dt = TIMER_MS/1000` (13 ms), which was actively
+         * harmful: real frames routinely land at 100-130 ms here (measured
+         * 2026-07-28), so the guard fired on normal frames and replaced a
+         * true 0.10 s step with 0.013 s. Every animation then advanced ~8x
+         * too little on exactly the slowest frames — clouds/particles
+         * visibly lurched instead of easing. That IS the "not buttery
+         * smooth" report. Clamp to a sane ceiling and KEEP the real value
+         * below it so motion stays proportional to elapsed time. */
+        if (!(dt > 0.0f)) dt = (float)TIMER_MS / 1000.0f;   /* also catches NaN */
+        else if (dt > 0.25f) dt = 0.25f;                    /* resume-from-stall cap */
         s_last_us = now;
         if (tick_us < tick_min) tick_min = tick_us;
         if (tick_us > tick_max) tick_max = tick_us;
@@ -5502,6 +6245,30 @@ static void native_render_task(void *arg)
 #else
         s_buf = s_render_buf;
 #endif
+        /* Await BOTH in-flight operations before touching the scene buffer.
+         * The scene buffers are swapped only after the PPA submit below, so on
+         * entry s_render_buf is exactly the buffer the previous rotation is
+         * still READING — rendering into it first tears the source and the
+         * panel shows a half-old frame (the flicker). The scan wait is here
+         * too so the fb swap it performs is settled before we present. */
+        bool present = true;
+        if (s_render_buf_alt) {
+            /* With three framebuffers there is no need to block on the panel
+             * scan: the buffer PPA writes is neither the one being scanned nor
+             * the one queued next. Only the previous ROTATION must be complete
+             * before we touch the scene buffer it was reading. */
+            if (s_ppa_inflight) {
+                if (xSemaphoreTake(s_ppa_done_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+                    ESP_LOGW(TAG, "PPA rotate timeout");
+                    s_ppa_inflight = false;
+                    vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
+                    continue;
+                }
+                s_ppa_inflight = false;
+            } else {
+                present = false;
+            }
+        }
         render_weather(dt);
         if (s_render_lock) {
             xSemaphoreGive(s_render_lock);
@@ -5509,49 +6276,112 @@ static void native_render_task(void *arg)
         int64_t t_render = esp_timer_get_time();
 
 #ifndef EVA_PORTRAIT_NATIVE
-        esp_err_t err = rotate_render_to_dpi_fb(s_dpi_back_fb);
-        if (err == ESP_OK) {
-            if (xSemaphoreTake(s_ppa_done_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
-                ESP_LOGW(TAG, "PPA rotate timeout");
+        /* PIPELINED ROTATION (2026-07-28).
+         * Pipelined path: the rotation of THIS frame is submitted below and
+         * awaited at the top of the NEXT iteration, so the ~14.7 ms PPA
+         * transfer overlaps the next frame's render instead of stalling the
+         * CPU. Two invariants make that safe:
+         *   - PPA reads the scene buffer, so the next render must target the
+         *     OTHER one (s_render_buf/s_render_buf_alt are swapped after the
+         *     submit) — otherwise we would overwrite pixels mid-transfer.
+         *   - PPA writes s_dpi_back_fb, so the fb swap and draw_bitmap for a
+         *     frame may only happen after ITS rotation completed. We
+         *     therefore drive the panel with the frame awaited here.
+         * Without the alt buffer (alloc failed) this degenerates to the old
+         * submit-then-wait behaviour. */
+        /* Non-pipelined fallback (alt scene buffer unavailable): rotate and
+         * wait inline, exactly the pre-2026-07-28 behaviour. */
+        esp_err_t err = ESP_OK;
+        if (!s_render_buf_alt) {
+            err = rotate_render_to_dpi_fb(s_dpi_back_fb, s_render_buf);
+            if (err == ESP_OK) {
+                if (xSemaphoreTake(s_ppa_done_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+                    ESP_LOGW(TAG, "PPA rotate timeout");
+                    vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
+                    continue;
+                }
+            } else {
+                ESP_LOGE(TAG, "PPA rotate failed: 0x%x", (unsigned)err);
                 vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
                 continue;
             }
-        } else {
-            ESP_LOGE(TAG, "PPA rotate failed: 0x%x", (unsigned)err);
-            vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
-            continue;
         }
 #else
         esp_err_t err = ESP_OK;
+        bool present = true;
 #endif
         int64_t t_rotate = esp_timer_get_time();
 
-        err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, 480, 800, s_dpi_back_fb);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "DPI fb swap failed: 0x%x", (unsigned)err);
-            vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
-            continue;
-        }
-        int64_t t_draw = esp_timer_get_time();
-        /* Wait for the panel to finish scanning before reusing the buffer.
-         * On timeout we must NOT swap (the next frame would write into an
-         * in-scan framebuffer) — but the frame still happened, so it keeps
-         * counting toward perf/adapt_budget below. Dropping it from the
-         * stats would hide exactly the scenes that time out most (fog). */
-        bool vsync_ok = xSemaphoreTake(s_vsync_sem, pdMS_TO_TICKS(40)) == pdTRUE;
-        int64_t t_vsync = esp_timer_get_time();
-        (void)t_draw;
-
-        if (vsync_ok) {
-            uint16_t *old_scan = s_dpi_scan_fb;
+        int64_t t_draw = t_rotate;
+        int64_t t_vsync = t_rotate;
+        if (present) {
+            /* Drain any refresh signalled BEFORE this frame. on_refresh_done
+             * fires on every panel refresh (60 Hz), not only for our
+             * draw_bitmap, so the binary semaphore is often already signalled
+             * on entry. Taking that stale signal would return "scan complete"
+             * for the PREVIOUS frame — we would then swap and submit the next
+             * PPA rotation into the buffer the panel is still scanning, which
+             * is exactly the periodic flicker seen on hardware 2026-07-28.
+             * Clearing it first makes the wait below mean what it says. */
+            err = esp_lcd_panel_draw_bitmap(s_panel, 0, 0, 480, 800, s_dpi_back_fb);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "DPI fb swap failed: 0x%x", (unsigned)err);
+                vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
+                continue;
+            }
+            t_draw = esp_timer_get_time();
+            /* Rotate the three buffers instead of blocking on the scan:
+             *   scan  <- back  (just handed to the panel)
+             *   back  <- free  (PPA finished writing it before the wait above)
+             *   free  <- old scan (the panel released it when it moved on)
+             * No wait is needed because the buffer PPA writes next is the one
+             * the panel finished with two frames ago. That is exactly what the
+             * third framebuffer buys, and why this no longer flickers. */
+            uint16_t *prev_scan = s_dpi_scan_fb;
             s_dpi_scan_fb = s_dpi_back_fb;
-            s_dpi_back_fb = old_scan;
-        } else {
-            s_vsync_timeouts++;
+            s_dpi_back_fb = s_dpi_free_fb;
+            s_dpi_free_fb = prev_scan;
+            t_vsync = t_draw;
         }
+
+#ifndef EVA_PORTRAIT_NATIVE
+        /* Submit THIS frame's rotation last, so it runs concurrently with the
+         * next iteration's render. s_dpi_back_fb is now the free buffer (the
+         * swap above handed the presented one to the panel), and the scene
+         * buffers are swapped so the next render cannot touch the source PPA
+         * is reading. */
+        if (s_render_buf_alt) {
+            /* Target the buffer the panel is NOT scanning. With the deferred
+             * vsync wait, draw_bitmap() above handed s_dpi_back_fb to the
+             * panel and the swap does not happen until the next iteration
+             * confirms the scan finished — so the free buffer right now is
+             * s_dpi_scan_fb (released by the previous swap). Writing
+             * s_dpi_back_fb here would write the in-scan buffer, which is the
+             * flicker this whole ordering exists to prevent. */
+            err = rotate_render_to_dpi_fb(s_dpi_free_fb, s_render_buf);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "PPA rotate failed: 0x%x", (unsigned)err);
+                vTaskDelay(pdMS_TO_TICKS(TIMER_MS));
+                continue;
+            }
+            s_ppa_inflight = true;
+            uint16_t *tmp = s_render_buf;
+            s_render_buf = s_render_buf_alt;
+            s_render_buf_alt = tmp;
+            s_display_buf = tmp;      /* screenshots read the completed scene */
+        }
+#endif
 
         s_last_frame_us = t_rotate - t0;
-        adapt_budget(s_last_frame_us);
+        /* Feed adapt_budget the WHOLE frame interval, not just render+rotate.
+         * s_last_frame_us stops at t_rotate and excludes draw_bitmap + the
+         * vsync wait, so it under-reports the true cost by ~40 ms. Against
+         * adapt_budget's 25 ms/14 ms thresholds that meant the quality
+         * governor saw a rosier frame than the panel actually delivered and
+         * kept ratcheting detail UP while real frames were already 60-100 ms
+         * — the governor was fighting the smoothness it exists to protect.
+         * tick_us is the real wall-clock interval between frame starts. */
+        adapt_budget(tick_us);
         prof_rotate_us += (t_rotate - t_render);
         s_accum_lvgl_slot_us += (t_vsync - t_draw);
 
@@ -5626,6 +6456,17 @@ void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel)
     }
     s_display_buf = s_render_buf;
     s_buf = s_render_buf;
+    /* Optional second scene buffer enabling the pipelined PPA rotation.
+     * Non-fatal: without it the render loop keeps the old submit-then-wait
+     * path, just without the overlap win. */
+    s_render_buf_alt = heap_caps_aligned_alloc(PPA_CACHE_ALIGN,
+                                               EVA_WEATHER_CANVAS_W * EVA_WEATHER_CANVAS_H * sizeof(uint16_t),
+                                               MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ESP_LOGI(TAG, "PPA rotation pipelining %s",
+             s_render_buf_alt ? "ENABLED (2 scene buffers)"
+                              : "disabled (alt scene buffer alloc failed)");
+    /* Procedural fog buffers. Both optional: without them fog falls back to
+     * the old CPU particle path. */
     if (!s_render_lock) {
         s_render_lock = xSemaphoreCreateMutex();
         if (!s_render_lock) {
@@ -5698,12 +6539,21 @@ void eva_weather_canvas_init_native(esp_lcd_panel_handle_t panel)
     init_cloud_strips();
     reset_particles_for_kind();
 
-    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 2,
+    /* Three framebuffers (CONFIG_BSP_LCD_DPI_BUFFER_NUMS=3, driver max is
+     * DPI_PANEL_MAX_FB_NUM=3). With only two, the pipelined rotation had
+     * nowhere safe to write: PPA had to target either the buffer the panel
+     * was scanning or the one queued for it. The third breaks that tie —
+     * at any instant one fb is being scanned, one holds the finished next
+     * frame, and one is free for PPA. */
+    ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(s_panel, 3,
                                                        (void **)&s_dpi_fb[0],
-                                                       (void **)&s_dpi_fb[1]));
+                                                       (void **)&s_dpi_fb[1],
+                                                       (void **)&s_dpi_fb[2]));
     s_dpi_scan_fb = s_dpi_fb[0];
     s_dpi_back_fb = s_dpi_fb[1];
-    ESP_LOGI(TAG, "DPI frame buffers: fb0=%p fb1=%p", (void *)s_dpi_fb[0], (void *)s_dpi_fb[1]);
+    s_dpi_free_fb = s_dpi_fb[2];
+    ESP_LOGI(TAG, "DPI frame buffers: fb0=%p fb1=%p fb2=%p",
+             (void *)s_dpi_fb[0], (void *)s_dpi_fb[1], (void *)s_dpi_fb[2]);
 
     s_ppa_done_sem = xSemaphoreCreateBinary();
     s_vsync_sem = xSemaphoreCreateBinary();
@@ -6012,33 +6862,69 @@ void eva_weather_canvas_set_transition_ms(int ms)
 void eva_weather_canvas_set_clock_text(const char *text)
 {
     if (!text) return;
+    bool changed;
     portENTER_CRITICAL(&s_text_mux);
-    strlcpy(s_clock_text, text, sizeof(s_clock_text));
+    changed = strncmp(s_clock_text, text, sizeof(s_clock_text)) != 0;
+    if (changed) strlcpy(s_clock_text, text, sizeof(s_clock_text));
     portEXIT_CRITICAL(&s_text_mux);
+    /* The cached scene base has the OLD string blitted into it, so it must be
+     * refreshed or the display keeps showing stale text. Nothing else notices
+     * this change: bake_scene_text_slot() sets s_scene_base_dirty too, but it
+     * only runs from inside the rebuild this flag gates — a chicken-and-egg
+     * that left the clock frozen until some unrelated event dirtied the base.
+     * Only flag on a real change so the incremental path stays idle otherwise. */
+    if (changed) s_scene_base_dirty = true;
 }
 
 void eva_weather_canvas_set_date_text(const char *text)
 {
     if (!text) return;
+    bool changed;
     portENTER_CRITICAL(&s_text_mux);
-    strlcpy(s_date_text, text, sizeof(s_date_text));
+    changed = strncmp(s_date_text, text, sizeof(s_date_text)) != 0;
+    if (changed) strlcpy(s_date_text, text, sizeof(s_date_text));
     portEXIT_CRITICAL(&s_text_mux);
+    /* The cached scene base has the OLD string blitted into it, so it must be
+     * refreshed or the display keeps showing stale text. Nothing else notices
+     * this change: bake_scene_text_slot() sets s_scene_base_dirty too, but it
+     * only runs from inside the rebuild this flag gates — a chicken-and-egg
+     * that left the clock frozen until some unrelated event dirtied the base.
+     * Only flag on a real change so the incremental path stays idle otherwise. */
+    if (changed) s_scene_base_dirty = true;
 }
 
 void eva_weather_canvas_set_temp_text(const char *text)
 {
     if (!text) return;
+    bool changed;
     portENTER_CRITICAL(&s_text_mux);
-    strlcpy(s_temp_text, text, sizeof(s_temp_text));
+    changed = strncmp(s_temp_text, text, sizeof(s_temp_text)) != 0;
+    if (changed) strlcpy(s_temp_text, text, sizeof(s_temp_text));
     portEXIT_CRITICAL(&s_text_mux);
+    /* The cached scene base has the OLD string blitted into it, so it must be
+     * refreshed or the display keeps showing stale text. Nothing else notices
+     * this change: bake_scene_text_slot() sets s_scene_base_dirty too, but it
+     * only runs from inside the rebuild this flag gates — a chicken-and-egg
+     * that left the clock frozen until some unrelated event dirtied the base.
+     * Only flag on a real change so the incremental path stays idle otherwise. */
+    if (changed) s_scene_base_dirty = true;
 }
 
 void eva_weather_canvas_set_desc_text(const char *text)
 {
     if (!text) return;
+    bool changed;
     portENTER_CRITICAL(&s_text_mux);
-    strlcpy(s_desc_text, text, sizeof(s_desc_text));
+    changed = strncmp(s_desc_text, text, sizeof(s_desc_text)) != 0;
+    if (changed) strlcpy(s_desc_text, text, sizeof(s_desc_text));
     portEXIT_CRITICAL(&s_text_mux);
+    /* The cached scene base has the OLD string blitted into it, so it must be
+     * refreshed or the display keeps showing stale text. Nothing else notices
+     * this change: bake_scene_text_slot() sets s_scene_base_dirty too, but it
+     * only runs from inside the rebuild this flag gates — a chicken-and-egg
+     * that left the clock frozen until some unrelated event dirtied the base.
+     * Only flag on a real change so the incremental path stays idle otherwise. */
+    if (changed) s_scene_base_dirty = true;
 }
 
 const uint16_t *eva_weather_canvas_display_buf(void)
@@ -6054,7 +6940,34 @@ void eva_weather_canvas_trigger_lightning(void)
 bool eva_weather_canvas_toggle_volume(void)
 {
     s_cloud_volume = !s_cloud_volume;
+    /* shadow/core are only allocated while volume rendering is on (they are
+     * 2/3 of the cloud pool — ~7 MB — and are never drawn otherwise), so the
+     * pool has to be rebuilt for the toggle to take effect in either
+     * direction. init_cloud_strips() frees and re-allocates every variant and
+     * takes the render lock internally via wait_cloud_bake_idle(). */
+    if (s_render_lock) xSemaphoreTake(s_render_lock, portMAX_DELAY);
+    init_cloud_strips();
+    if (s_render_lock) xSemaphoreGive(s_render_lock);
     return s_cloud_volume;
+}
+
+void eva_weather_canvas_suspend_cloud_assets(void)
+{
+    /* Order is load-bearing: clearing the flag first means any bake that starts
+     * after this line already takes the procedural path, so the wait below only
+     * has to drain bakes that were ALREADY running. Waiting first would leave a
+     * window where a fresh bake could start and then read a partially-erased
+     * partition. */
+    s_cloud_assets_ok = false;
+    wait_cloud_bake_idle();
+
+    /* Hold the render lock across the handoff so no frame is mid-blend from a
+     * pack-backed variant when the mapping goes away. */
+    if (s_render_lock) xSemaphoreTake(s_render_lock, portMAX_DELAY);
+    eva_cloud_assets_suspend();
+    if (s_render_lock) xSemaphoreGive(s_render_lock);
+
+    ESP_LOGW(TAG, "cloud pack readers quiesced for OTA");
 }
 
 bool eva_weather_canvas_copy_display(uint16_t *dst, size_t dst_bytes)

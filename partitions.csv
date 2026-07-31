@@ -1,6 +1,19 @@
 # Name,   Type, SubType, Offset,  Size, Flags
 # Note: if you change the phy_init or app partition offset, make sure to change the offset in Kconfig.projbuild
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, ,        4M,
-storage,  data, 0x40,    ,        11M,
+#
+# OTA layout (2026-08-01). App slots are 2.5M each: the app is ~1.5 MB and the
+# OTA stack (esp_http_server + mdns + app_update) adds ~0.2 MB, so 2.5M leaves
+# ~40% headroom — a future feature must never force another cable flash of the
+# partition table. storage ends exactly at the 16 MB flash top.
+#   otadata 0x10000 + 0x2000 = 0x12000 -> next app rounds up to 64K = 0x20000
+#   ota_0   0x20000 + 0x280000 = 0x2A0000
+#   ota_1   0x2A0000 + 0x280000 = 0x520000
+#   storage 0x520000 + 0xAE0000 = 0x1000000  (10.875 MB for a 7.60 MB pack)
+# NOTE: the pack moved from 0x410000 to 0x520000 — esptool read_flash recipes
+# that still say 0x410000 are wrong (see CLAUDE.md §6).
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+otadata,  data, ota,     0x10000,  0x2000,
+ota_0,    app,  ota_0,   0x20000,  0x280000,
+ota_1,    app,  ota_1,   0x2A0000, 0x280000,
+storage,  data, 0x40,    0x520000, 0xAE0000,

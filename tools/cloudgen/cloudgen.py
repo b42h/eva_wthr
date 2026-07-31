@@ -11,10 +11,20 @@ import numpy as np
 
 # Layer ids match eva_weather_canvas.c: 0=HIGH, 1=MID, 2=LOW.
 PROFILES = {
-    0: dict(  # cirrus: thin X-stretched streaks, translucent
-        base_nx=6, base_ny=32, octaves=5, gain=0.55,
-        stretch_x=8.0, warp=22.0, warp_y_scale=0.0,
-        cover=0.54, soft=0.14, dens_gain=0.68,
+    0: dict(  # cirrus: fibrous wind-stretched streaks, translucent
+        # Anisotropy is deliberate but BOUNDED. The original profile
+        # (base_nx=6 / stretch_x=8 -> nx=2, base_ny=32) gave the noise a 16:1
+        # vertical:horizontal detail ratio, so every feature spanned the full
+        # 800 px strip as a flat horizontal ribbon with no internal structure
+        # ("long lines" artifact, 2026-07-28). warp_y_scale=0 made it worse:
+        # with no vertical domain warp there was nothing to break a band once
+        # formed. Real cirrus is fibrous — streaks of VARYING length with
+        # hooked ends — so keep it stretched (~4:1) but give X actual detail
+        # (nx 2 -> 4) and re-enable vertical warp. Measured gradient ratio
+        # |dD/dy|/|dD/dx|: 16.2x before, 4.3x after.
+        base_nx=12, base_ny=18, octaves=6, gain=0.60,
+        stretch_x=3.0, warp=34.0, warp_y_scale=0.22,
+        cover=0.52, soft=0.20, dens_gain=0.70,
         cover_min=0.08, cover_max=0.45,
         atten=2.2, core_lo=0.55, core_hi=0.95, core_gain=0.25,
         ridge=0.0, ridge_upper=0.0, ridge_lower=0.0,
@@ -217,6 +227,11 @@ def decompose(D, p):
     l8 = a8(light)
     s8 = (total.astype(int) - l8.astype(int)).clip(0, 255).astype(np.uint8)
     return l8, s8, a8(core)
+
+def to_portrait(mask):
+    """270° CCW transpose of an (H,W) A8 mask → (W,H). Matches eva_orient.h
+    eva_land_to_port so device draws it 1:1 into the portrait fb."""
+    return np.rot90(mask, k=1).copy()
 
 def merge_strips(d_upper, d_lower):
     """Composite two density fields into one strip (over operator, clamped).

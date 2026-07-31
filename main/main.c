@@ -23,8 +23,13 @@
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 
+#include "esp_ota_ops.h"
+
 #include "eva_cdc.h"
 #include "eva_clock.h"
+#include "eva_ota.h"
+#include "eva_ota_state.h"
+#include "eva_ota_status.h"
 #include "eva_settings.h"
 #include "eva_screenshot.h"
 #include "eva_weather.h"
@@ -42,6 +47,7 @@ static const char *EVA_FIRMWARE_VERSION = "1";
 static eva_cdc_t *s_cdc;
 static eva_settings_t *s_settings;
 static eva_wifi_status_t *s_wifi_status;
+static eva_ota_status_t *s_ota_status;
 static eva_clock_t *s_clock;
 
 /* CDC `clockoffset` hour shift applied to wall clock + canvas sky timing.
@@ -389,7 +395,11 @@ static void weatherdebug_apply(void *user)
             if (st.sunset_min < 0)  st.sunset_min  = live->sunset_min;
         }
     }
-    snprintf(st.desc, sizeof(st.desc), "%s наживо", weather_kind_label_uk(kind));
+    /* Plain label, no marker. This used to append " наживо" ("live"), which
+     * was both wrong (weatherdebug is the opposite of live) and user-visible
+     * on the panel. eva_weather.c keys its "discard debug snapshot from NVS"
+     * check off that marker, so it now uses the transient flag instead. */
+    snprintf(st.desc, sizeof(st.desc), "%s", weather_kind_label_uk(kind));
     st.fetched_at = time(NULL);
     eva_weather_set_transient(&st);
     eva_weather_canvas_set_weather(&st);
@@ -593,7 +603,12 @@ static void cdc_handle_command(void *user, char *line)
             "  screenshot\r\n"
             "  log\r\n"
             "  log <none|error|warn|info|debug|verbose>\r\n"
-            "  transition <ms> — smooth-transition duration (0 = instant)\r\n");
+            "  transition <ms> — smooth-transition duration (0 = instant)\r\n"
+            "  otainfo — IP, mDNS name, recorded hashes, running slot\r\n"
+            "  otaserver on|off — HTTP update server\r\n"
+            "  otavalidate — confirm the running image (cancel rollback)\r\n"
+            "  otarollback — revert to the previous app slot and reboot\r\n"
+            "  otaclearhash app|pack|all — force a re-send on the next ota.py\r\n");
         return;
     }
 
@@ -887,7 +902,110 @@ static void cdc_handle_command(void *user, char *line)
         return;
     }
 
+    /* OTA commands are debug conveniences — the real update path is the HTTP
+     * server, because sending a CDC command needs the cable this feature
+     * exists to eliminate. `otainfo` is the "where is my device" recovery
+     * command: it prints the IP and the mDNS name. */
+    if (strcmp(cmd, "otainfo") == 0) {
+        char buf[640];
+        eva_ota_info(buf, sizeof buf);
+        cdc_send(buf);
+        return;
+    }
+
+    if (strcmp(cmd, "otaserver on") == 0) {
+        cdc_sendf("OK ota server %s\r\n", eva_ota_server_start() ? "started" : "FAILED");
+        return;
+    }
+
+    if (strcmp(cmd, "otaserver off") == 0) {
+        eva_ota_server_stop();
+        cdc_send("OK ota server stopped\r\n");
+        return;
+    }
+
+    if (strcmp(cmd, "otavalidate") == 0) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        cdc_sendf("OK mark_app_valid -> %s\r\n", esp_err_to_name(err));
+        return;
+    }
+
+    if (strcmp(cmd, "otarollback") == 0) {
+        cdc_send("OK rolling back to the previous slot; rebooting\r\n");
+        vTaskDelay(pdMS_TO_TICKS(200));
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+        return;
+    }
+
+    if (strncmp(cmd, "otaclearhash", 12) == 0) {
+        const char *what = cmd + 12;
+        while (*what == ' ') ++what;
+        if (strcmp(what, "app") == 0) {
+            eva_ota_state_clear_app_sha();
+            cdc_send("OK app hash cleared\r\n");
+        } else if (strcmp(what, "pack") == 0) {
+            eva_ota_state_clear_pack_sha();
+            cdc_send("OK pack hash cleared\r\n");
+        } else if (strcmp(what, "all") == 0 || *what == '\0') {
+            eva_ota_state_clear_app_sha();
+            eva_ota_state_clear_pack_sha();
+            cdc_send("OK app+pack hashes cleared\r\n");
+        } else {
+            cdc_send("ERR otaclearhash app|pack|all\r\n");
+        }
+        return;
+    }
+
     cdc_send("ERR unknown command; type help\r\n");
+}
+
+/* Rollback gate. With CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE a freshly booted
+ * OTA image is PENDING_VERIFY: unless it marks itself valid, the bootloader
+ * reverts to the previous slot on the next reset.
+ *
+ * "Valid" here means the two things that make the panel recoverable, not just
+ * that main() ran:
+ *   - Wi-Fi came back. Without it no future update can be pushed, which is the
+ *     real brick condition for a device with no cable workflow.
+ *   - The render loop is actually producing frames.
+ * The 90 s Wi-Fi budget covers WIFI_START_DELAY_MS (10 s) plus a full
+ * WIFI_CONNECT_WAIT_MS (30 s) attempt with room to spare — do not shorten it
+ * below ~60 s or a slow AP will trigger a spurious rollback. */
+static void ota_validate_task(void *arg)
+{
+    (void)arg;
+
+    const esp_partition_t *run = esp_ota_get_running_partition();
+    esp_ota_img_states_t st;
+    if (!run || esp_ota_get_state_partition(run, &st) != ESP_OK ||
+        st != ESP_OTA_IMG_PENDING_VERIFY) {
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "image is PENDING_VERIFY — running self-check");
+
+    /* Poll instead of one long wait: eva_wifi_start() creates its event group
+     * inside its own task, and eva_wifi_wait_connected() called before that
+     * exists just sleeps out the entire timeout — which here would look like
+     * "Wi-Fi never came up" and trigger a rollback of a perfectly good image. */
+    bool wifi_ok = false;
+    for (int i = 0; i < 90 && !wifi_ok; ++i) {
+        wifi_ok = eva_wifi_is_connected();
+        if (!wifi_ok) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+    bool render_ok = eva_weather_canvas_last_tick_hz() > 0;
+
+    if (wifi_ok && render_ok) {
+        esp_ota_mark_app_valid_cancel_rollback();
+        ESP_LOGI(TAG, "self-check passed — image marked VALID");
+    } else {
+        ESP_LOGE(TAG, "self-check FAILED (wifi=%d render=%d) — rolling back",
+                 wifi_ok, render_ok);
+        esp_ota_mark_app_invalid_rollback_and_reboot();
+    }
+    vTaskDelete(NULL);
 }
 
 static void weather_screen_init_native(esp_lcd_panel_handle_t panel)
@@ -941,6 +1059,14 @@ void app_main(void)
     eva_wifi_set_status_cb(wifi_status_cb);
     eva_wifi_start();
     weather_fetch_start();
+
+    /* If the bootloader ran the other slot, the recorded app hash describes an
+     * image that is not running — drop it so ota.py re-pushes. */
+    if (eva_ota_state_check_rollback()) {
+        ESP_LOGW(TAG, "app was rolled back to %s", esp_ota_get_running_partition()->label);
+    }
+    eva_ota_start(s_ota_status);
+    xTaskCreate(ota_validate_task, "ota_validate", 4096, NULL, 2, NULL);
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000));

@@ -186,10 +186,27 @@ int64_t eva_cloud_assets_last_load_us(void)
     return s_last_load_us;
 }
 
+void eva_cloud_assets_suspend(void)
+{
+    /* Clearing s_pack is what actually makes this safe: eva_cloud_assets_load()
+     * already bails on !s_pack, so no code path can dereference the mapping
+     * once this returns. Zeroing the counts makes the canvas treat every layer
+     * as "no variants available" and bake procedurally instead.
+     *
+     * The mapping handle is deliberately NOT unmapped: the pack OTA reboots
+     * immediately afterwards, and munmap semantics while a write is in flight
+     * are a risk with no upside here.
+     *
+     * Sprites already live in PSRAM (copied at init), so they are untouched. */
+    s_pack = NULL;
+    memset(s_counts, 0, sizeof s_counts);
+    ESP_LOGW(TAG, "pack reads suspended — procedural clouds until reboot");
+}
+
 bool eva_cloud_assets_load(int layer, cloud_pool_t pool, int idx,
                            uint8_t *a8_light, uint8_t *a8_shadow,
                            uint8_t *a8_core,
-                           int dst_w, int dst_h,
+                           int dst_w, int dst_h, int dst_stride,
                            bool mirror_x, float scale)
 {
     if (!s_pack || layer < 0 || layer >= EVA_CLOUD_LAYERS ||
@@ -215,16 +232,24 @@ bool eva_cloud_assets_load(int layer, cloud_pool_t pool, int idx,
 
     char log_ctx[24];
     snprintf(log_ctx, sizeof log_ctx, "L%d v%d", layer, idx);
+    /* A NULL destination means the caller does not keep that plane (the
+     * shipped light-only path drops shadow/core to save ~7 MB of PSRAM — see
+     * cloud_variant_t in eva_weather_canvas.c). Skip BOTH the decompress and
+     * the resample for those, but still advance `off` by the stored
+     * compressed size so the following planes stay correctly located. */
     uint8_t *dsts[3] = { a8_light, a8_shadow, a8_core };
     size_t off = CLM_HEADER_BYTES;
     for (int m = 0; m < 3; ++m) {
         uint32_t csize = hdr.comp_size[m];
-        if (!clm_decompress_plane(clm, e->size, off, csize, s_scratch,
-                                  src_bytes, log_ctx, m)) {
-            return false;
+        if (dsts[m]) {
+            if (!clm_decompress_plane(clm, e->size, off, csize, s_scratch,
+                                      src_bytes, log_ctx, m)) {
+                return false;
+            }
+            clm_scale_mask_stride(s_scratch, hdr.w, hdr.h,
+                                  dsts[m], dst_w, dst_h, dst_stride,
+                                  scale, mirror_x);
         }
-        clm_scale_mask(s_scratch, hdr.w, hdr.h,
-                       dsts[m], dst_w, dst_h, scale, mirror_x);
         off += csize;
     }
     s_last_load_us = esp_timer_get_time() - t0;

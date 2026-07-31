@@ -164,8 +164,18 @@ def capture(port: str, outfile: Path) -> int:
             sys.stderr.write(f"missing END marker, got: {bytes(tail)!r}\n")
             return 1
 
-        outfile.write_bytes(bytes(payload))
-        print(f"saved {size} bytes to {outfile}")
+        try:
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(bytes(payload)))
+            img = img.rotate(-90, expand=True)
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=90)
+            outfile.write_bytes(buf.getvalue())
+            print(f"saved {len(buf.getvalue())} bytes to {outfile} (host-rotated to landscape)")
+        except ImportError:
+            outfile.write_bytes(bytes(payload))
+            print(f"saved {size} bytes to {outfile} (portrait; install Pillow to auto-rotate)")
         return 0
     finally:
         ser.close()

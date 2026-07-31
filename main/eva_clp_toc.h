@@ -36,6 +36,7 @@ typedef struct {
 #define EVA_CLP_TYPE_RAIN  6   /* offline rain-streak A8 loop frame */
 #define EVA_CLP_TYPE_FOG   7   /* offline fog band A8 (single, drifted) */
 #define EVA_CLP_TYPE_SKY   8   /* offline sky keyframe RGB565 column */
+#define EVA_CLP_TYPE_FLASH 9   /* lightning flash: radial A8 falloff, one blend */
 
 /* Number of baked moon phases in the pack (tools/cloudgen/sprites.py
  * MOON_PHASE_COUNT, tools/cloudgen/genpool.py). Must match exactly — the

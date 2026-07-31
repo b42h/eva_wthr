@@ -31,6 +31,10 @@ over hosted Wi-Fi.
   over the cloud deck in thunderstorms.
 - Hosted Wi-Fi + HTTP time sync, NVS timezone, TinyUSB CDC debug console,
   screenshot capture.
+- **OTA updates over Wi-Fi** (`tools/ota.py`) with content hashing, so only
+  the artifacts that actually changed are transferred — an untouched 7.6 MB
+  cloud pack costs one HTTP request instead of a minute of upload. Dual app
+  slots with bootloader rollback; a corrupted pack self-heals.
 
 For the history of what has been built and what is still planned, see
 [`docs/DONE.md`](docs/DONE.md) and the pending specs/plans under
@@ -115,6 +119,89 @@ From `phase7_eva_weather`:
 download mode, waits for the ROM USB port, then runs
 `esptool ... write_flash @flash_args`.
 
+## Update over Wi-Fi (no cable)
+
+Once the OTA-capable firmware is on the panel, the cable is only ever needed
+again if you change the partition table.
+
+```sh
+python3 tools/ota.py --host eva-weather.local
+```
+
+It builds, asks the device what it already has, and sends **only what
+changed**. Useful flags:
+
+| Flag | Effect |
+|---|---|
+| `--no-build` | use `build/` as-is |
+| `--dry-run` | print the diff, send nothing |
+| `--app-only` / `--pack-only` | restrict what may be sent |
+| `--force` | send even when hashes match |
+| `--host <ip>` | skip mDNS (see the note below) |
+
+Typical output when only the firmware changed:
+
+```text
+device  eva-weather.local  fw 20260801T…  slot ota_0 (valid)
+app   13cb605e… -> 799feac5…  CHANGED    1.58 MB
+pack  38651994… == 38651994…  unchanged  (skip 7.60 MB)
+```
+
+Exit codes: `0` updated / already current, `1` transfer failed, `2`
+unreachable, `3` build failed, `4` the device rolled back.
+
+### How it decides what changed
+
+The device records the SHA-256 the **host** said it sent, in NVS — it never
+recomputes a hash from flash. A flashed image is not byte-identical to the
+`.bin` file (image headers, padding), so a device-side hash would mismatch
+forever and re-send 7.6 MB on every run. The cost of this design is one
+redundant transfer on the very first update; after that it is exact.
+
+### Safety properties
+
+- **Verify before commit.** The SHA is checked *before*
+  `esp_ota_set_boot_partition()`, so a truncated upload can never become
+  bootable. A bad hash returns HTTP 400 and leaves the device untouched.
+- **Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. A new image must
+  pass a self-check — Wi-Fi back up *and* the render loop producing frames —
+  or the bootloader reverts on the next reset. Wi-Fi is the gate that matters:
+  without it no further update could be pushed.
+- **The cloud pack is written in place** (two 7.6 MB copies do not fit), which
+  is safe because the canvas has a real "no pack" mode: readers are quiesced
+  first and clouds fall back to procedural generation during the write.
+- **Power loss mid-pack-write self-heals.** The pack fails to parse at boot,
+  the panel renders procedurally, the stored hash is cleared, and the next
+  `ota.py` run re-sends the pack automatically. No cable, no manual step.
+
+### Partition layout
+
+OTA needs two app slots, so the table changed — **flash it once over USB**,
+after which updates are wireless:
+
+```text
+otadata  0x10000  0x2000
+ota_0    0x20000  0x280000   (2.5 MB; app is ~1.6 MB)
+ota_1   0x2A0000  0x280000
+storage 0x520000  0xAE0000   (10.875 MB; pack is 7.60 MB)
+```
+
+The cloud pack now lives at **`0x520000`** (it used to be `0x410000`) — any
+older `esptool read_flash` recipe needs updating.
+
+### mDNS caveat
+
+The panel advertises `eva-weather.local` and an `_eva-ota._tcp` service, but
+hostname resolution proved unreliable on at least one network. If
+`eva-weather.local` does not resolve, pass `--host <ip>`. Find the address
+with the CDC `otainfo` command or `arp -a | grep espressif`.
+
+### No authentication
+
+The update endpoints are plain HTTP with no auth — anyone on the same LAN can
+flash the device. That is a deliberate choice for a home network; add a shared
+secret before putting this on a network you do not control.
+
 ## Flash recovery (manual BOOT+RST)
 
 Use this if the runtime CDC port is unstable or missing.
@@ -153,6 +240,8 @@ weatherdebug <kind> <frame>            cloudinfo
 weatherpin on|off      transition <ms> cloudvolume
 lightning              screenshot      log [<level>]
 wind <signed_kph>|clear
+otainfo                otaserver on|off
+otavalidate            otarollback     otaclearhash app|pack|all
 ```
 
 `<kind>`: `clear-day clear-night partly-cloudy-day partly-cloudy-night
@@ -169,6 +258,14 @@ cloudy fog rain heavy-rain snow thunderstorm sleet hail`
 - `lightning` forces a strike (thunderstorm/hail only).
 - `perf` reports `vsync_timeouts`: frames where the panel had not finished
   scanning within 40 ms, so the buffer swap was skipped. Should be 0.
+- `otainfo` prints the IP, mDNS name, recorded hashes and running slot — the
+  "where is my device" command when mDNS is not cooperating.
+- The `ota*` commands are debugging conveniences, **not** the update path:
+  sending them needs the USB cable that OTA exists to eliminate. Use
+  `tools/ota.py` to actually update.
+- `otaclearhash` forces the next `ota.py` run to re-send that artifact.
+- **CDC gotcha:** do not call `reset_input_buffer()` right after opening the
+  port in your own scripts — the panel then appears to answer nothing.
 
 ### Capturing screenshots and GIFs
 

@@ -76,8 +76,13 @@ static bool ensure_encoder(void)
         };
         s_out_buf = jpeg_alloc_encoder_mem(EVA_JPEG_OUT_CAP, &mem, &s_out_buf_sz);
         if (!s_out_buf || s_out_buf_sz < 4096) {
-            ESP_LOGE(TAG, "output buffer alloc failed (cap %u, got %u)",
-                     (unsigned)EVA_JPEG_OUT_CAP, (unsigned)s_out_buf_sz);
+            ESP_LOGE(TAG, "output buffer alloc failed (cap %u, got %u, ptr=%p) "
+                     "spiram_free=%u spiram_dma_free=%u internal_dma_free=%u",
+                     (unsigned)EVA_JPEG_OUT_CAP, (unsigned)s_out_buf_sz,
+                     (void *)s_out_buf,
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
+                     (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA));
             s_disabled = true;
             return false;
         }

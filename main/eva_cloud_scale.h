@@ -29,16 +29,28 @@ static inline bool clm_parse_header(const uint8_t *buf, size_t len,
 }
 
 /* Bilinear resample of an A8 mask from src (sw×sh) into dst (dw×dh).
+ * `dst_stride` is the physical row pitch of dst in bytes; pass dw when the
+ * rows are packed. A larger stride lets the caller keep spare columns after
+ * each row (the device duplicates the first screen-width there so a scrolled
+ * window never needs a second, wrapped PPA band).
  * `scale` > 1 magnifies around the centre ("clouds closer"); X wraps
  * (strips tile seamlessly in X), Y clamps (strip edges are feathered).
  * `mirror_x` flips the output horizontally. scale==1 with equal dims and
  * no mirror is a straight copy. */
-static inline void clm_scale_mask(const uint8_t *src, int sw, int sh,
-                                  uint8_t *dst, int dw, int dh,
-                                  float scale, bool mirror_x)
+static inline void clm_scale_mask_stride(const uint8_t *src, int sw, int sh,
+                                         uint8_t *dst, int dw, int dh,
+                                         int dst_stride,
+                                         float scale, bool mirror_x)
 {
+    if (dst_stride < dw) dst_stride = dw;
     if (sw == dw && sh == dh && !mirror_x && fabsf(scale - 1.0f) < 1e-3f) {
-        memcpy(dst, src, (size_t)sw * (size_t)sh);
+        if (dst_stride == dw) {
+            memcpy(dst, src, (size_t)sw * (size_t)sh);
+        } else {
+            for (int y = 0; y < sh; ++y) {
+                memcpy(&dst[(size_t)y * dst_stride], &src[(size_t)y * sw], (size_t)sw);
+            }
+        }
         return;
     }
     /* Total source step per dst pixel: resolution ratio / depth scale. */
@@ -64,7 +76,7 @@ static inline void clm_scale_mask(const uint8_t *src, int sw, int sh,
         if (y1 >= sh) { y1 = sh - 1; if (y0 > y1) y0 = y1; fy = 0.0f; }
         const uint8_t *r0 = &src[y0 * sw];
         const uint8_t *r1 = &src[y1 * sw];
-        uint8_t *drow = &dst[y * dw];
+        uint8_t *drow = &dst[(size_t)y * dst_stride];
         for (int x = 0; x < dw; ++x) {
             float xs = (float)x;
             float sx = cx + (xs - (float)dw * 0.5f) * step_x;
@@ -97,4 +109,12 @@ static inline void clm_scale_mask(const uint8_t *src, int sw, int sh,
         }
     }
 #undef EVA_CLM_SEAM_PX
+}
+
+/* Packed-row convenience wrapper (dst_stride == dw). */
+static inline void clm_scale_mask(const uint8_t *src, int sw, int sh,
+                                  uint8_t *dst, int dw, int dh,
+                                  float scale, bool mirror_x)
+{
+    clm_scale_mask_stride(src, sw, sh, dst, dw, dh, dw, scale, mirror_x);
 }

@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
+#include "esp_netif.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -15,6 +16,11 @@ extern "C" {
 void eva_wifi_start(void);
 bool eva_wifi_wait_connected(TickType_t timeout);
 bool eva_wifi_is_connected(void);
+
+/* Current STA address. False when not connected. The status callback reports
+ * the IP as a display string; this is the programmatic form the OTA module and
+ * the `otainfo` command need. */
+bool eva_wifi_get_ip(esp_netif_ip_info_t *out);
 
 /* Status reporter callback. Called from the wifi task whenever state changes.
  * String is short, statically allocated, safe to pass to lv_label_set_text.

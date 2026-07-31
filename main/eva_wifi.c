@@ -13,11 +13,7 @@
 #include "esp_event.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
-#include "sdkconfig.h"
 
-/* Credentials come from menuconfig (Eva Weather -> Wi-Fi SSID / password),
- * declared in main/Kconfig.projbuild. Never hardcode them here — this repo
- * is public. See README "Configure Wi-Fi and location". */
 #define WIFI_SSID       CONFIG_EVA_WIFI_SSID
 #define WIFI_PASSWORD   CONFIG_EVA_WIFI_PASSWORD
 #define WIFI_START_DELAY_MS  10000
@@ -39,6 +35,11 @@ static EventGroupHandle_t s_evt;
 static int s_retry = 0;
 static eva_wifi_status_cb_t s_status_cb = NULL;
 static char s_status_buf[64];
+/* The STA netif, kept so eva_wifi_get_ip() can hand the raw address to the OTA
+ * module and the `otainfo` command. Before this the IP existed only as the
+ * formatted string in s_status_buf, which is fine for a label but useless to
+ * anything that needs the actual octets. */
+static esp_netif_t *s_sta_netif = NULL;
 
 static void report(const char *msg)
 {
@@ -100,6 +101,7 @@ static esp_err_t wifi_bring_up(void)
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_t *sta = esp_netif_create_default_wifi_sta();
     assert(sta);
+    s_sta_netif = sta;
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -315,4 +317,12 @@ bool eva_wifi_is_connected(void)
         return false;
     }
     return (xEventGroupGetBits(s_evt) & BIT_CONNECTED) != 0;
+}
+
+bool eva_wifi_get_ip(esp_netif_ip_info_t *out)
+{
+    if (!out || !s_sta_netif || !eva_wifi_is_connected()) {
+        return false;
+    }
+    return esp_netif_get_ip_info(s_sta_netif, out) == ESP_OK;
 }
